@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "serial_to_board": {
+    "E66368254F3D2625": {
+      "name": "ODO",
+      "type": "C-MFL",
+      "exclude": []
+    }
+  }
+}
