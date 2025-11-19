@@ -75,6 +75,7 @@ def resource_path(relative_path: str) -> str:
 DATA_FIRMWARE = resource_path("firmware/DATA.uf2")
 EGP_FIRMWARE  = resource_path("firmware/EGP.uf2")
 MFL_FIRMWARE  = resource_path("firmware/MFL.uf2")
+CMFL_FIRMWARE = resource_path("firmware/CMFL.uf2")
 
 # ---------------------------- GLOBALS ----------------------------
 RUN_START = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -176,9 +177,7 @@ class StatusTracker:
             return g("copy") == "success"
         if option_mode in ("MFL", "MFL_PREF"):
             return g("format") == "success"
-        if option_mode == "MFL_ALL_SLOTS":
-            return g("mfl_upload") == "success"
-        if option_mode == "EGP_ALL_SLOTS":
+        if option_mode in ("MFL_ALL_SLOTS", "CMFL_ALL_SLOTS", "EGP_ALL_SLOTS"):
             return g("mfl_upload") == "success"
         if option_mode == "AUTO_FORMAT_BURN":
             return g("format") == "success" and g("mfl_upload") == "success"
@@ -1042,6 +1041,22 @@ def op_mfl_burn_slot(board: str, port: str, slot: int, *, already_in_menu: bool 
     disconnect_mux(port, board)
     return bool(ok)
 
+def op_cmfl_burn_slot(board: str, port: str, slot: int, *, already_in_menu: bool = False) -> bool:
+    if CANCEL_EVENT.is_set():
+        mark_and_update(board, slot, "mfl_upload", "failed", "cancelled")
+        return False
+    if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+        mark_and_update(board, slot, "mfl_upload", "failed", "port/board dead")
+        return False
+    if not already_in_menu:
+        if send_command(port, "1") is None:
+            mark_and_update(board, slot, "mfl_upload", "failed", "serial open failed")
+            return False
+        time.sleep(0.5)
+    ok = _boot_and_upload_uf2(port, slot, CMFL_FIRMWARE, board, "mfl_upload")
+    disconnect_mux(port, board)
+    return bool(ok)
+
 def op_egp_burn_slot(board: str, port: str, slot: int, *, already_in_menu: bool = False) -> bool:
     if CANCEL_EVENT.is_set():
         mark_and_update(board, slot, "mfl_upload", "failed", "cancelled")
@@ -1115,6 +1130,8 @@ def retry_single(board_name: str, slot: int, mode: str) -> bool:
             return op_format_pref_slot(board_name, port, slot)
         if mode == "MFL_ALL_SLOTS":
             return op_mfl_burn_slot(board_name, port, slot)
+        if mode == "CMFL_ALL_SLOTS":
+            return op_cmfl_burn_slot(board_name, port, slot)
         if mode == "EGP_ALL_SLOTS":
             return op_egp_burn_slot(board_name, port, slot)
         if mode == "AUTO_FORMAT_BURN":
@@ -1251,6 +1268,30 @@ def process_board_mfl_all_slots(board: str, port: str, selection: Optional[Dict[
             break
         try:
             op_mfl_burn_slot(board, port, slot, already_in_menu=True)
+            time.sleep(0.25)
+        finally:
+            pass
+
+def process_board_cmfl_all_slots(board: str, port: str, selection: Optional[Dict[str, Set[int]]], stagger_seconds: int = 0) -> None:
+    if stagger_seconds > 0:
+        time.sleep(stagger_seconds)
+    if _cancelled():
+        return
+    if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+        log(f"[{board}] Port dead. Skipping board.")
+        return
+    if send_command(port, "1") is None:
+        log(f"[{board}] Could not enter slot menu; skipping board.")
+        return
+    time.sleep(0.5)
+    for slot in selected_slots_for(board, selection):
+        if _cancelled():
+            break
+        if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+            log(f"[{board}] Port dead. Skipping remaining slots.")
+            break
+        try:
+            op_cmfl_burn_slot(board, port, slot, already_in_menu=True)
             time.sleep(0.25)
         finally:
             pass
@@ -1588,6 +1629,13 @@ def process_all_boards_with_selection(mode: str, selection: Optional[Dict[str, S
                 process_board_mfl_all_slots(board, port, RUN_SELECTION, stagger_seconds=0)
                 time.sleep(0.25)
 
+        elif mode == "CMFL_ALL_SLOTS":
+            for board, port in selected_boards:
+                if CANCEL_EVENT.is_set():
+                    break
+                process_board_cmfl_all_slots(board, port, RUN_SELECTION, stagger_seconds=0)
+                time.sleep(0.25)
+
         elif mode == "EGP_ALL_SLOTS":
             for board, port in selected_boards:
                 if CANCEL_EVENT.is_set():
@@ -1748,8 +1796,9 @@ class AdvancedDialog(QDialog):
         uf_row = QHBoxLayout()
         self.btn_up_data = QPushButton("Upload DATA.uf2 to RPI-RP2")
         self.btn_up_mfl  = QPushButton("Upload MFL.uf2 to RPI-RP2")
+        self.btn_up_cmfl = QPushButton("Upload CMFL.uf2 to RPI-RP2")
         self.btn_up_egp  = QPushButton("Upload EGP.uf2 to RPI-RP2")
-        uf_row.addWidget(self.btn_up_data); uf_row.addWidget(self.btn_up_mfl); uf_row.addWidget(self.btn_up_egp); uf_row.addStretch(1)
+        uf_row.addWidget(self.btn_up_data); uf_row.addWidget(self.btn_up_mfl); uf_row.addWidget(self.btn_up_cmfl); uf_row.addWidget(self.btn_up_egp); uf_row.addStretch(1)
         v.addLayout(uf_row)
 
         self.send_line.returnPressed.connect(self.on_send)
@@ -1758,6 +1807,7 @@ class AdvancedDialog(QDialog):
         self.btn_send.clicked.connect(self.on_send)
         self.btn_up_data.clicked.connect(lambda: self.on_upload(DATA_FIRMWARE))
         self.btn_up_mfl.clicked.connect(lambda: self.on_upload(MFL_FIRMWARE))
+        self.btn_up_cmfl.clicked.connect(lambda: self.on_upload(CMFL_FIRMWARE))
         self.btn_up_egp.clicked.connect(lambda: self.on_upload(EGP_FIRMWARE))
 
     def on_connect(self):
@@ -2051,7 +2101,7 @@ class MainWindow(QMainWindow):
         ("DATA", "1. DATA EXTRACTION FALLBACK"),
         ("MFL", "2. FORMAT ALL SLOTS FALLBACK"),
         ("MFL_ALL_SLOTS", "3. BURN MFL.uf2"),
-        ("AUTO_FORMAT_BURN", "4. AUTO: Format → Burn MFL"),
+        ("CMFL_ALL_SLOTS", "4. BURN CMFL.uf2"),
         ("LABEL", "5. LABEL ALL SLOTS"),
         ("EGP_ALL_SLOTS", "6. BURN EGP.uf2 (all slots)"),
         ("AUTO_FORMAT_BURN_EGP", "7. AUTO: Format → Burn EGP"),
@@ -2840,9 +2890,9 @@ class MainWindow(QMainWindow):
 # ---------------------------- CLI ----------------------------
 def main_cli() -> None:
     print("CLI runs on all registry-detected boards/slots.")
-    choice = input("Select option (1=DATA,2=MFL,3=MFL_ALL_SLOTS,4=AUTO_FORMAT_BURN,5=LABEL,6=EGP_ALL_SLOTS,7=AUTO_FORMAT_BURN_EGP,8=DATA_PREF,9=MFL_PREF,10=ODO,11=INLB): ").strip()
+    choice = input("Select option (1=DATA,2=MFL,3=MFL_ALL_SLOTS,4=CMFL_ALL_SLOTS,5=LABEL,6=EGP_ALL_SLOTS,7=AUTO_FORMAT_BURN_EGP,8=DATA_PREF,9=MFL_PREF,10=ODO,11=INLB): ").strip()
     opt_map = {
-        "1":"DATA","2":"MFL","3":"MFL_ALL_SLOTS","4":"AUTO_FORMAT_BURN",
+        "1":"DATA","2":"MFL","3":"MFL_ALL_SLOTS","4":"CMFL_ALL_SLOTS",
         "5":"LABEL","6":"EGP_ALL_SLOTS","7":"AUTO_FORMAT_BURN_EGP","8":"DATA_PREF","9":"MFL_PREF",
         "10":"ODO","11":"INLB"
     }
