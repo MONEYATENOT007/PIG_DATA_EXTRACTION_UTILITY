@@ -2480,7 +2480,6 @@ class MainWindow(QMainWindow):
 
     def on_reg_save(self):
         serial_to_board: Dict[str, Dict] = {}
-        seen_names = set()
         for i in range(self.reg_table.rowCount()):
             s_item = self.reg_table.item(i,0); n_item = self.reg_table.item(i,1); t_item = self.reg_table.item(i,2); e_item = self.reg_table.item(i,3)
             serial = (s_item.text().strip() if s_item else "")
@@ -2490,10 +2489,6 @@ class MainWindow(QMainWindow):
             if not serial or not name:
                 QMessageBox.warning(self, "Registry", f"Row {i+1}: Serial and Name are required.")
                 return
-            if name in seen_names:
-                QMessageBox.warning(self, "Registry", f"Row {i+1}: Duplicate board name '{name}'.")
-                return
-            seen_names.add(name)
             if btype not in self.BOARD_TYPES:
                 QMessageBox.warning(self, "Registry", f"Row {i+1}: Type must be one of {', '.join(self.BOARD_TYPES)}.")
                 return
