@@ -68,9 +68,33 @@ REGISTRY = load_registry()
 
 # ---------------------------- RESOURCES ----------------------------
 def resource_path(relative_path: str) -> str:
+    """
+    Resolve a resource path for both source and frozen (PyInstaller) modes.
+    Preference order:
+      1) Next to the executable (for frozen) or CWD (for source)
+      2) PyInstaller _MEIPASS unpack directory (if present)
+    This allows keeping firmware/config outside the EXE while still supporting
+    older bundles that ship them inside _MEIPASS.
+    """
+    base_candidates: List[str] = []
+    if getattr(sys, "frozen", False):
+        # Prefer files next to the executable when frozen
+        base_candidates.append(os.path.dirname(os.path.abspath(sys.executable)))
+    # Also consider current working directory
+    base_candidates.append(os.path.abspath("."))
+    # Finally, consider the PyInstaller unpack directory if available
     if hasattr(sys, "_MEIPASS"):
-        return os.path.join(sys._MEIPASS, relative_path)
-    return os.path.join(os.path.abspath("."), relative_path)
+        base_candidates.append(getattr(sys, "_MEIPASS"))
+
+    for base in base_candidates:
+        candidate = os.path.join(base, relative_path)
+        if os.path.exists(candidate):
+            return candidate
+
+    # Fallback: first base + relative path
+    if base_candidates:
+        return os.path.join(base_candidates[0], relative_path)
+    return relative_path
 
 DATA_FIRMWARE = resource_path("firmware/DATA.uf2")
 EGP_FIRMWARE  = resource_path("firmware/EGP.uf2")
