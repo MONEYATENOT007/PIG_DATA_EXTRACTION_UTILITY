@@ -4,6 +4,7 @@
     "E664B49507531B2F": {
       "name": "H1",
       "type": "C-MFL",
+      "pipe_size": 18,
       "exclude": [
         7
       ]
@@ -11,6 +12,7 @@
     "E664B4950723572F": {
       "name": "H2",
       "type": "C-MFL",
+      "pipe_size": 18,
       "exclude": [
         7
       ]
@@ -18,6 +20,7 @@
     "E664B4950727A233": {
       "name": "H3",
       "type": "C-MFL",
+      "pipe_size": 18,
       "exclude": [
         7
       ]
@@ -25,6 +28,7 @@
     "E664B4950754402F": {
       "name": "H4",
       "type": "C-MFL",
+      "pipe_size": 18,
       "exclude": [
         5
       ]
@@ -32,6 +36,7 @@
     "E664B49507556833": {
       "name": "H5",
       "type": "C-MFL",
+      "pipe_size": 18,
       "exclude": [
         7
       ]
@@ -39,6 +44,7 @@
     "E664B49507499D33": {
       "name": "H6",
       "type": "C-MFL",
+      "pipe_size": 18,
       "exclude": [
         8
       ]
@@ -46,6 +52,7 @@
     "E664B495078D5A2F": {
       "name": "H7",
       "type": "C-MFL",
+      "pipe_size": 18,
       "exclude": [
         7
       ]
@@ -53,6 +60,7 @@
     "E664B49507690E2F": {
       "name": "H8",
       "type": "C-MFL",
+      "pipe_size": 18,
       "exclude": [
         8
       ]
@@ -60,26 +68,31 @@
     "E66368254F676521": {
       "name": "B1",
       "type": "A-MFL",
+      "pipe_size": 18,
       "exclude": []
     },
     "E66368254F1E5F27": {
       "name": "B2",
       "type": "A-MFL",
+      "pipe_size": 18,
       "exclude": []
     },
     "E664B4950783632F": {
       "name": "B3",
       "type": "A-MFL",
+      "pipe_size": 18,
       "exclude": []
     },
     "E664B495076C2B2F": {
       "name": "B4",
       "type": "A-MFL",
+      "pipe_size": 18,
       "exclude": []
     },
     "E664B49507364E2F": {
       "name": "B5",
       "type": "A-MFL",
+      "pipe_size": 18,
       "exclude": [
         5
       ]
@@ -87,6 +100,7 @@
     "E664B49507144B30": {
       "name": "B6",
       "type": "A-MFL",
+      "pipe_size": 18,
       "exclude": [
         5
       ]
@@ -94,6 +108,7 @@
     "E66208F4173AA439": {
       "name": "B7",
       "type": "A-MFL",
+      "pipe_size": 18,
       "exclude": [
         4
       ]
@@ -101,6 +116,7 @@
     "E664B49507906631": {
       "name": "B8",
       "type": "A-MFL",
+      "pipe_size": 18,
       "exclude": [
         3
       ]
@@ -108,6 +124,7 @@
     "E664B4950734142F": {
       "name": "E4",
       "type": "EGP",
+      "pipe_size": 0,
       "exclude": [
         3
       ]
@@ -115,6 +132,7 @@
     "E664B495070A552F": {
       "name": "E1",
       "type": "EGP",
+      "pipe_size": 18,
       "exclude": [
         3
       ]
@@ -122,6 +140,7 @@
     "E66368254F2A5F27": {
       "name": "E3",
       "type": "EGP",
+      "pipe_size": 18,
       "exclude": [
         5
       ]
@@ -129,6 +148,7 @@
     "E664B49507996533": {
       "name": "E2",
       "type": "EGP",
+      "pipe_size": 18,
       "exclude": [
         3,
         5
@@ -137,11 +157,13 @@
     "E66368254F69AD28": {
       "name": "ODO",
       "type": "C-MFL",
+      "pipe_size": 18,
       "exclude": []
     },
     "16931720": {
       "name": "INLB",
       "type": "C-MFL",
+      "pipe_size": 18,
       "exclude": []
     }
   }

@@ -1778,10 +1778,19 @@ def process_odo_extraction() -> None:
         return
     board, port = target
     ok = True
-    # Enter/exit sequences separated with delays to avoid menu bounce
-    if send_command(port, "m") is None:
+    # Try to ensure we are at the main menu first, then enter ODO menu with 'm'.
+    # Extra delays added because this menu was flaky in earlier builds.
+    try:
+        send_command(port, "0")
+    except Exception:
+        pass
+    time.sleep(1.0)
+
+    resp_m = send_command(port, "m")
+    if resp_m is None:
         ok = False
-    time.sleep(2.0)
+    time.sleep(3.0)
+
     if ok and send_command(port, "1") is None:
         ok = False
     time.sleep(2.0)
