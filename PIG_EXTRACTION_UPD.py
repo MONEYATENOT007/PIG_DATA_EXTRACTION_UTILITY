@@ -42,7 +42,7 @@ def load_registry() -> Dict[str, Dict]:
                     return data
     except Exception:
         pass
-    return {"version": 2, "serial_to_board": {}}  # v2 adds "exclude"
+    return {"version": 3, "serial_to_board": {}}  # v2 adds "exclude", v3 adds "pipe_size"
 
 def save_registry(reg: Dict[str, Dict]) -> None:
     try:
@@ -85,6 +85,7 @@ MODE_CURRENT: Optional[str] = None
 BOARD_PORTS_CURRENT: Dict[str, str] = {}        # board_name -> COMx
 BOARD_TYPES_CURRENT: Dict[str, str] = {}        # board_name -> type key
 BOARD_EXCLUDE_SLOTS: Dict[str, Set[int]] = {}   # board_name -> excluded slots from registry
+BOARD_PIPE_SIZES: Dict[str, int] = {}           # board_name -> pipe size in inches
 RUN_SELECTION: Optional[Dict[str, Set[int]]] = None
 
 BOARD_SLOT_LIMITS = {"A-MFL": 5, "C-MFL": 8, "EGP": 5}
@@ -183,7 +184,7 @@ class StatusTracker:
             return g("format") == "success" and g("mfl_upload") == "success"
         if option_mode == "AUTO_FORMAT_BURN_EGP":
             return g("format") == "success" and g("mfl_upload") == "success"
-        if option_mode == "LABEL":
+        if option_mode in ("LABEL", "LABEL_PREF"):
             return g("label") == "success"
         if option_mode in ("ODO", "INLB"):
             return g("special") == "success"
@@ -371,7 +372,13 @@ def board_name_from_index(idx: int) -> str:
     return f"Board_{idx}"
 
 def build_label(mode: str, bidx: int, slot: int) -> str:
-    prefix = "EGP" if mode.upper() == "EGP" else "MFL"
+    mu = (mode or "").upper()
+    if mu == "EGP":
+        prefix = "EGP"
+    elif mu == "CMFL":
+        prefix = "CMFL"
+    else:
+        prefix = "MFL"
     raw = f"{prefix}B{bidx}S{slot}".upper()
     cleaned = re.sub(r"[^A-Z0-9 ]", "", raw)
     label = cleaned[:MAX_LABEL_LEN]
@@ -382,7 +389,7 @@ def build_label(mode: str, bidx: int, slot: int) -> str:
 def parse_compact_label(lbl: str) -> Optional[Tuple[str, int, int]]:
     if not lbl:
         return None
-    m = re.match(r"^(MFL|EGP)B(\d+)S(\d+)$", lbl.strip().upper())
+    m = re.match(r"^(MFL|EGP|CMFL)B(\d+)S(\d+)$", lbl.strip().upper())
     if not m:
         return None
     try:
@@ -393,6 +400,14 @@ def parse_compact_label(lbl: str) -> Optional[Tuple[str, int, int]]:
 def get_board_type(board_name: str) -> str:
     t = BOARD_TYPES_CURRENT.get(board_name)
     return t if t in BOARD_SLOT_LIMITS else "C-MFL"
+
+def get_board_label_prefix(board_name: str) -> str:
+    t = get_board_type(board_name).upper()
+    if t == "EGP":
+        return "EGP"
+    if t == "C-MFL":
+        return "CMFL"
+    return "MFL"
 
 def get_slot_limit(board_name: str) -> int:
     # ODO/INLB are slot-less
@@ -434,6 +449,7 @@ def detect_boards() -> Dict[str, str]:
     board_ports: Dict[str, str] = {}
     board_types: Dict[str, str] = {}
     board_excl: Dict[str, Set[int]] = {}
+    board_pipe_sizes: Dict[str, int] = {}
 
     for port in serial.tools.list_ports.comports():
         serial_number = getattr(port, "serial_number", None)
@@ -443,6 +459,11 @@ def detect_boards() -> Dict[str, str]:
             entry = serial_to_board[serial_number] or {}
             name = entry.get("name") or f"Board_{serial_number[-4:]}"
             btype = (entry.get("type") or "C-MFL").upper()
+            pipe_raw = entry.get("pipe_size", "")
+            try:
+                pipe_size = int(pipe_raw)
+            except Exception:
+                pipe_size = 0
             exclude_raw = entry.get("exclude", [])
             try:
                 if isinstance(exclude_raw, str):
@@ -456,10 +477,12 @@ def detect_boards() -> Dict[str, str]:
             board_ports[name] = port.device
             board_types[name] = btype if btype in BOARD_SLOT_LIMITS else "C-MFL"
             board_excl[name] = exclude
+            board_pipe_sizes[name] = pipe_size
 
-    global BOARD_TYPES_CURRENT, BOARD_EXCLUDE_SLOTS
+    global BOARD_TYPES_CURRENT, BOARD_EXCLUDE_SLOTS, BOARD_PIPE_SIZES
     BOARD_TYPES_CURRENT = board_types
     BOARD_EXCLUDE_SLOTS = board_excl
+    BOARD_PIPE_SIZES = board_pipe_sizes
     log(f"[INFO] Detected boards (registry-based): {board_ports}")
     return board_ports
 
@@ -889,7 +912,8 @@ def op_data_slot(board: str, port: str, expected_slot: int, *, already_in_menu: 
             mark_and_update(board, expected_slot, "copy", "failed", "boot data uf2 failed")
             return False
 
-        expected_label = build_label("MFL", expected_bidx, expected_slot)
+        prefix = get_board_label_prefix(board)
+        expected_label = build_label(prefix, expected_bidx, expected_slot)
         sd_drive = wait_for_drive_by_label([expected_label], timeout=30)
         if not sd_drive:
             sd_drive = wait_for_new_drive(timeout=30, expect_bootloader=False)
@@ -942,7 +966,8 @@ def op_data_log_slot(board: str, port: str, expected_slot: int, *, already_in_me
             mark_and_update(board, expected_slot, "copy", "failed", "boot data uf2 failed")
             return False
 
-        expected_label = build_label("MFL", expected_bidx, expected_slot)
+        prefix = get_board_label_prefix(board)
+        expected_label = build_label(prefix, expected_bidx, expected_slot)
         sd_drive = wait_for_drive_by_label([expected_label], timeout=30)
         if not sd_drive:
             sd_drive = wait_for_new_drive(timeout=30, expect_bootloader=False)
@@ -989,7 +1014,8 @@ def op_data_pref_slot(board: str, port: str, slot: int) -> bool:
         return False
 
     bidx = board_index(board)
-    expected_label = build_label("MFL", bidx, slot)
+    prefix = get_board_label_prefix(board)
+    expected_label = build_label(prefix, bidx, slot)
     sd_drive = wait_for_drive_by_label([expected_label], timeout=15)
     if not sd_drive:
         sd_drive = wait_for_new_drive(timeout=20, expect_bootloader=False)
@@ -1038,7 +1064,8 @@ def op_data_log_pref_slot(board: str, port: str, slot: int) -> bool:
         return False
 
     bidx = board_index(board)
-    expected_label = build_label("MFL", bidx, slot)
+    prefix = get_board_label_prefix(board)
+    expected_label = build_label(prefix, bidx, slot)
     sd_drive = wait_for_drive_by_label([expected_label], timeout=15)
     if not sd_drive:
         sd_drive = wait_for_new_drive(timeout=20, expect_bootloader=False)
@@ -1129,7 +1156,8 @@ def op_format_pref_slot(board: str, port: str, slot: int) -> bool:
         return False
 
     bidx = board_index(board)
-    expected_label = build_label("MFL", bidx, slot)
+    prefix = get_board_label_prefix(board)
+    expected_label = build_label(prefix, bidx, slot)
     sd_drive = wait_for_drive_by_label([expected_label], timeout=15)
     if not sd_drive:
         sd_drive = wait_for_new_drive(timeout=20, expect_bootloader=False)
@@ -1158,6 +1186,47 @@ def op_format_pref_slot(board: str, port: str, slot: int) -> bool:
     send_command(port, "9")
     time.sleep(2.0)
     return True
+
+def op_label_pref_slot(board: str, port: str, slot: int) -> bool:
+    if CANCEL_EVENT.is_set():
+        mark_and_update(board, slot, "label", "failed", "cancelled")
+        return False
+    if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+        mark_and_update(board, slot, "label", "failed", "port/board dead")
+        return False
+
+    # We are in SD-card management menu; connect this slot
+    if send_command(port, str(slot)) is None:
+        mark_and_update(board, slot, "label", "failed", "serial open failed (slot connect)")
+        return False
+
+    bidx = board_index(board)
+    prefix = get_board_label_prefix(board)
+    target_label = build_label(prefix, bidx, slot)
+
+    sd_drive = wait_for_new_drive(timeout=20, expect_bootloader=False)
+    if not sd_drive:
+        mark_and_update(board, slot, "label", "failed", "sd not detected")
+        try:
+            send_command(port, "9")
+            time.sleep(2.0)
+        except Exception:
+            pass
+        return False
+
+    ok_lbl = enforce_label(sd_drive.strip("\\"), target_label)
+    if ok_lbl:
+        mark_and_update(board, slot, "label", "success", "")
+    else:
+        mark_and_update(board, slot, "label", "failed", "label verify failed")
+
+    try:
+        send_command(port, "9")
+        time.sleep(2.0)
+    except Exception:
+        pass
+
+    return bool(ok_lbl)
 
 def op_mfl_burn_slot(board: str, port: str, slot: int, *, already_in_menu: bool = False) -> bool:
     if CANCEL_EVENT.is_set():
@@ -1228,7 +1297,8 @@ def op_label_slot(board: str, port: str, slot: int, *, already_in_menu: bool = F
         if not sd_drive:
             mark_and_update(board, slot, "label", "failed", "sd not detected")
             disconnect_mux(port, board); return False
-        target_label = build_label("MFL", bidx, slot)
+        prefix = get_board_label_prefix(board)
+        target_label = build_label(prefix, bidx, slot)
     ok_lbl = enforce_label(sd_drive.strip("\\"), target_label)
     if ok_lbl:
         mark_and_update(board, slot, "label", "success", "")
@@ -1248,7 +1318,7 @@ def retry_single(board_name: str, slot: int, mode: str) -> bool:
         log(f"[{board_name}] Retry skipped: port dead or not found.")
         return False
     try:
-        if mode in ("DATA_PREF", "MFL_PREF"):
+        if mode in ("DATA_PREF", "MFL_PREF", "LABEL_PREF"):
             send_command(port, "0")
             time.sleep(0.05)
             if not enter_sd_menu(port, board_name):
@@ -1284,6 +1354,8 @@ def retry_single(board_name: str, slot: int, mode: str) -> bool:
             return op_egp_burn_slot(board_name, port, slot)
         if mode == "LABEL":
             return op_label_slot(board_name, port, slot)
+        if mode == "LABEL_PREF":
+            return op_label_pref_slot(board_name, port, slot)
         return False
     finally:
         try:
@@ -1544,6 +1616,27 @@ def process_board_label_only(board: str, port: str, selection: Optional[Dict[str
         finally:
             pass
 
+def process_board_label_preferred(board: str, port: str, selection: Optional[Dict[str, Set[int]]]) -> None:
+    if _cancelled():
+        return
+    if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+        log(f"[{board}] Port dead. Skipping board.")
+        return
+    if not enter_sd_menu(port, board):
+        log(f"[{board}] Could not enter SD menu; skipping board.")
+        return
+    for slot in selected_slots_for(board, selection):
+        if _cancelled():
+            break
+        if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+            log(f"[{board}] Port dead. Skipping remaining slots.")
+            break
+        try:
+            op_label_pref_slot(board, port, slot)
+            time.sleep(0.2)
+        finally:
+            pass
+
 # -------- NEW: DATA_PREF coordinator (sequential connect, parallel copy) --------
 def process_data_pref_pipelined(selected_boards: List[Tuple[str, str]], selection: Optional[Dict[str, Set[int]]], kick_gap_sec: float = 2.0) -> None:
     states: List[Dict[str, object]] = []
@@ -1596,7 +1689,8 @@ def process_data_pref_pipelined(selected_boards: List[Tuple[str, str]], selectio
                         continue
 
                     bidx = board_index(board)
-                    expected_label = build_label("MFL", bidx, slot)
+                    prefix = get_board_label_prefix(board)
+                    expected_label = build_label(prefix, bidx, slot)
                     sd_drive = wait_for_drive_by_label([expected_label], timeout=15)
                     if not sd_drive:
                         sd_drive = wait_for_new_drive(timeout=20, expect_bootloader=False)
@@ -1872,6 +1966,13 @@ def process_all_boards_with_selection(mode: str, selection: Optional[Dict[str, S
                 if CANCEL_EVENT.is_set():
                     break
                 process_board_label_only(board, port, RUN_SELECTION)
+                time.sleep(0.2)
+
+        elif mode == "LABEL_PREF":
+            for board, port in selected_boards:
+                if CANCEL_EVENT.is_set():
+                    break
+                process_board_label_preferred(board, port, RUN_SELECTION)
                 time.sleep(0.2)
 
         elif mode == "ODO":
@@ -2307,6 +2408,7 @@ class MainWindow(QMainWindow):
         ("INLB", "11. INLB EXTRACTION"),
         ("DATA_LOG", "12. DATA EXTRACTION LOG"),
         ("DATA_LOG_PREF", "13. DATA EXTRACTION LOG PREFERRED"),
+        ("LABEL_PREF", "14. LABEL SLOTS PREFFERED"),
     ]
     BOARD_TYPES = ["A-MFL", "C-MFL", "EGP"]
 
@@ -2417,8 +2519,8 @@ class MainWindow(QMainWindow):
         # Registry
         reg_group = QGroupBox("Board Registry (Serial → Name → Type → Exclude Slots)")
         reg_layout = QVBoxLayout()
-        self.reg_table = QTableWidget(0, 4)
-        self.reg_table.setHorizontalHeaderLabels(["Serial", "Board Name", "Type (A-MFL/C-MFL/EGP)", "Exclude Slots (e.g. 2,5)"])
+        self.reg_table = QTableWidget(0, 5)
+        self.reg_table.setHorizontalHeaderLabels(["Serial", "Board Name", "Type (A-MFL/C-MFL/EGP)", "Pipe size (inches)", "Exclude Slots (e.g. 2,5)"])
         self.reg_table.setEditTriggers(QAbstractItemView.AllEditTriggers)
         self.reg_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         reg_btn_row = QHBoxLayout()
@@ -2634,12 +2736,14 @@ class MainWindow(QMainWindow):
             self.reg_table.setItem(r, 0, QTableWidgetItem(ser))
             self.reg_table.setItem(r, 1, QTableWidgetItem(entry.get("name", "")))
             self.reg_table.setItem(r, 2, QTableWidgetItem(entry.get("type", "C-MFL")))
+            pipe_val = entry.get("pipe_size", "")
+            self.reg_table.setItem(r, 3, QTableWidgetItem(str(pipe_val) if pipe_val not in (None, "") else ""))
             excl = entry.get("exclude", "")
             if isinstance(excl, list):
                 excl_str = ", ".join(str(x) for x in excl)
             else:
                 excl_str = str(excl or "")
-            self.reg_table.setItem(r, 3, QTableWidgetItem(excl_str))
+            self.reg_table.setItem(r, 4, QTableWidgetItem(excl_str))
         self.reg_table.resizeColumnsToContents()
 
     def on_reg_add_row(self):
@@ -2649,6 +2753,7 @@ class MainWindow(QMainWindow):
         self.reg_table.setItem(r, 1, QTableWidgetItem(f"Board_{r+1}"))
         self.reg_table.setItem(r, 2, QTableWidgetItem("C-MFL"))
         self.reg_table.setItem(r, 3, QTableWidgetItem(""))
+        self.reg_table.setItem(r, 4, QTableWidgetItem(""))
 
     def on_reg_delete_row(self):
         row = self.reg_table.currentRow()
@@ -2673,6 +2778,7 @@ class MainWindow(QMainWindow):
             t = "EGP" if "EGP" in (port.description or "").upper() else "C-MFL"
             self.reg_table.setItem(r, 2, QTableWidgetItem(t))
             self.reg_table.setItem(r, 3, QTableWidgetItem(""))
+            self.reg_table.setItem(r, 4, QTableWidgetItem(""))
             added += 1
         if added == 0:
             QMessageBox.information(self, "Registry", "No new connected serials found.")
@@ -2680,10 +2786,11 @@ class MainWindow(QMainWindow):
     def on_reg_save(self):
         serial_to_board: Dict[str, Dict] = {}
         for i in range(self.reg_table.rowCount()):
-            s_item = self.reg_table.item(i,0); n_item = self.reg_table.item(i,1); t_item = self.reg_table.item(i,2); e_item = self.reg_table.item(i,3)
+            s_item = self.reg_table.item(i,0); n_item = self.reg_table.item(i,1); t_item = self.reg_table.item(i,2); p_item = self.reg_table.item(i,3); e_item = self.reg_table.item(i,4)
             serial = (s_item.text().strip() if s_item else "")
             name = (n_item.text().strip() if n_item else "")
             btype = (t_item.text().strip().upper() if t_item else "C-MFL")
+            pipe_raw = (p_item.text().strip() if p_item else "")
             excl_raw = (e_item.text().strip() if e_item else "")
             if not serial or not name:
                 QMessageBox.warning(self, "Registry", f"Row {i+1}: Serial and Name are required.")
@@ -2691,11 +2798,18 @@ class MainWindow(QMainWindow):
             if btype not in self.BOARD_TYPES:
                 QMessageBox.warning(self, "Registry", f"Row {i+1}: Type must be one of {', '.join(self.BOARD_TYPES)}.")
                 return
+            if pipe_raw:
+                if not pipe_raw.isdigit():
+                    QMessageBox.warning(self, "Registry", f"Row {i+1}: Pipe size must be an integer (inches).")
+                    return
+                pipe_size = int(pipe_raw)
+            else:
+                pipe_size = 0
             try:
                 excl = {int(x) for x in re.split(r"[,\s]+", excl_raw) if x.strip().isdigit()}
             except Exception:
                 excl = set()
-            serial_to_board[serial] = {"name": name, "type": btype, "exclude": sorted(excl)}
+            serial_to_board[serial] = {"name": name, "type": btype, "pipe_size": pipe_size, "exclude": sorted(excl)}
         REGISTRY["serial_to_board"] = serial_to_board
         save_registry(REGISTRY)
         QMessageBox.information(self, "Registry", "Saved. Re-detecting boards.")
@@ -3109,11 +3223,11 @@ class MainWindow(QMainWindow):
 # ---------------------------- CLI ----------------------------
 def main_cli() -> None:
     print("CLI runs on all registry-detected boards/slots.")
-    choice = input("Select option (1=DATA,2=MFL,3=MFL_ALL_SLOTS,4=CMFL_ALL_SLOTS,5=LABEL,6=EGP_ALL_SLOTS,7=AUTO_FORMAT_BURN_EGP,8=DATA_PREF,9=MFL_PREF,10=ODO,11=INLB,12=DATA_LOG,13=DATA_LOG_PREF): ").strip()
+    choice = input("Select option (1=DATA,2=MFL,3=MFL_ALL_SLOTS,4=CMFL_ALL_SLOTS,5=LABEL,6=EGP_ALL_SLOTS,7=AUTO_FORMAT_BURN_EGP,8=DATA_PREF,9=MFL_PREF,10=ODO,11=INLB,12=DATA_LOG,13=DATA_LOG_PREF,14=LABEL_PREF): ").strip()
     opt_map = {
         "1":"DATA","2":"MFL","3":"MFL_ALL_SLOTS","4":"CMFL_ALL_SLOTS",
         "5":"LABEL","6":"EGP_ALL_SLOTS","7":"AUTO_FORMAT_BURN_EGP","8":"DATA_PREF","9":"MFL_PREF",
-        "10":"ODO","11":"INLB","12":"DATA_LOG","13":"DATA_LOG_PREF"
+        "10":"ODO","11":"INLB","12":"DATA_LOG","13":"DATA_LOG_PREF","14":"LABEL_PREF"
     }
     mode = opt_map.get(choice, "INVALID")
     if mode == "INVALID":
