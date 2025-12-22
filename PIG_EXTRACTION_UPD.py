@@ -173,7 +173,7 @@ class StatusTracker:
     @staticmethod
     def slot_done(option_mode: str, phases: Dict[str, Dict[str, str]]) -> bool:
         g = lambda k: (phases.get(k, {}) or {}).get("status", "")
-        if option_mode in ("DATA", "DATA_PREF"):
+        if option_mode in ("DATA", "DATA_PREF", "DATA_LOG", "DATA_LOG_PREF"):
             return g("copy") == "success"
         if option_mode in ("MFL", "MFL_PREF"):
             return g("format") == "success"
@@ -677,6 +677,38 @@ def copy_file_with_progress(src: str, dest: str, retries: int = 3, delay: float 
     log(f"[ERROR] Failed to copy {src}")
     return False
 
+def log_sdcard_file_info(src_drive: str, dest_folder: str, board: str, slot: int, vol_label: str) -> bool:
+    try:
+        if CANCEL_EVENT.is_set():
+            return False
+        if not os.path.exists(src_drive):
+            log(f"[LOG {board}:{slot}] Drive {src_drive} not found for logging.")
+            return False
+        file_map = top_level_file_map(src_drive)
+        if not file_map:
+            log(f"[LOG {board}:{slot}] No files found on {src_drive} to log.")
+            return False
+        os.makedirs(dest_folder, exist_ok=True)
+        log_path = os.path.join(dest_folder, "data_log.txt")
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(
+                f"=== DATA LOG | board={board} slot={slot} | "
+                f"label={vol_label or 'UNKNOWN'} | drive={src_drive} | time={ts} ===\n"
+            )
+            for name in sorted(file_map.keys()):
+                size = file_map.get(name, -1)
+                if size is None or size < 0:
+                    f.write(f"{name} | size=unknown\n")
+                else:
+                    f.write(f"{name} | {size} bytes\n")
+            f.write("\n")
+        log(f"[LOGGED] {board} slot {slot} | {len(file_map)} files from {src_drive} -> {log_path}")
+        return True
+    except Exception as e:
+        log(f"[ERROR] Failed to write data log for {board}:{slot}: {e}")
+        return False
+
 def top_level_file_map(root_path: str) -> Dict[str, int]:
     try:
         entries = os.listdir(root_path)
@@ -891,6 +923,59 @@ def op_data_slot(board: str, port: str, expected_slot: int, *, already_in_menu: 
     disconnect_mux(port, board)
     return bool(okcopy)
 
+def op_data_log_slot(board: str, port: str, expected_slot: int, *, already_in_menu: bool = False) -> bool:
+    if CANCEL_EVENT.is_set():
+        mark_and_update(board, expected_slot, "copy", "failed", "cancelled")
+        return False
+    if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+        mark_and_update(board, expected_slot, "copy", "failed", "port/board dead")
+        return False
+    if not already_in_menu:
+        if send_command(port, "1") is None:
+            mark_and_update(board, expected_slot, "copy", "failed", "serial open failed")
+            return False
+        time.sleep(0.5)
+    expected_bidx = board_index(board)
+    with BOOT_LOCK:
+        ok = _boot_and_upload_uf2(port, expected_slot, DATA_FIRMWARE, board, "boot_data")
+        if not ok:
+            mark_and_update(board, expected_slot, "copy", "failed", "boot data uf2 failed")
+            return False
+
+        expected_label = build_label("MFL", expected_bidx, expected_slot)
+        sd_drive = wait_for_drive_by_label([expected_label], timeout=30)
+        if not sd_drive:
+            sd_drive = wait_for_new_drive(timeout=30, expect_bootloader=False)
+        if not sd_drive:
+            mark_and_update(board, expected_slot, "copy", "failed", "sd not detected")
+            return False
+
+        vol_label = (get_drive_label(sd_drive.strip("\\")) or "").strip().upper()
+        parsed = parse_compact_label(vol_label)
+
+        if vol_label:
+            by_label_dir = os.path.join("Extracted_Data", "By_Label", vol_label)
+        else:
+            by_label_dir = os.path.join("Extracted_Data", "By_Label", f"UNLABELED_B{expected_bidx}S{expected_slot}")
+
+        if parsed:
+            _, lbl_bidx, lbl_slot = parsed
+            t_board = find_board_name_by_index(lbl_bidx); t_slot = lbl_slot
+        else:
+            t_board = board; t_slot = expected_slot
+
+    oklog = log_sdcard_file_info(sd_drive, by_label_dir, t_board, t_slot, vol_label)
+
+    if oklog:
+        mark_and_update(board, expected_slot, "copy", "success",
+                        f"logged via label '{vol_label or 'UNKNOWN'}' -> {t_board}:{t_slot}")
+    else:
+        mark_and_update(board, expected_slot, "copy", "failed",
+                        f"log failed; label '{vol_label or 'UNKNOWN'}' mapped to {t_board}:{t_slot}")
+
+    disconnect_mux(port, board)
+    return bool(oklog)
+
 def op_data_pref_slot(board: str, port: str, slot: int) -> bool:
     if CANCEL_EVENT.is_set():
         mark_and_update(board, slot, "copy", "failed", "cancelled")
@@ -939,6 +1024,55 @@ def op_data_pref_slot(board: str, port: str, slot: int) -> bool:
     send_command(port, "9")
     time.sleep(2.0)
     return bool(okcopy)
+
+def op_data_log_pref_slot(board: str, port: str, slot: int) -> bool:
+    if CANCEL_EVENT.is_set():
+        mark_and_update(board, slot, "copy", "failed", "cancelled")
+        return False
+    if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+        mark_and_update(board, slot, "copy", "failed", "port/board dead")
+        return False
+
+    if send_command(port, str(slot)) is None:
+        mark_and_update(board, slot, "copy", "failed", "serial open failed (slot connect)")
+        return False
+
+    bidx = board_index(board)
+    expected_label = build_label("MFL", bidx, slot)
+    sd_drive = wait_for_drive_by_label([expected_label], timeout=15)
+    if not sd_drive:
+        sd_drive = wait_for_new_drive(timeout=20, expect_bootloader=False)
+    if not sd_drive:
+        mark_and_update(board, slot, "copy", "failed", "sd not detected")
+        send_command(port, "9"); time.sleep(2.0)
+        return False
+
+    vol_label = (get_drive_label(sd_drive.strip("\\")) or "").strip().upper()
+    parsed = parse_compact_label(vol_label)
+
+    if vol_label:
+        by_label_dir = os.path.join("Extracted_Data", "By_Label", vol_label)
+    else:
+        by_label_dir = os.path.join("Extracted_Data", "By_Label", f"UNLABELED_B{bidx}S{slot}")
+
+    if parsed:
+        _, lbl_bidx, lbl_slot = parsed
+        t_board = find_board_name_by_index(lbl_bidx); t_slot = lbl_slot
+    else:
+        t_board = board; t_slot = slot
+
+    oklog = log_sdcard_file_info(sd_drive, by_label_dir, t_board, t_slot, vol_label)
+
+    if oklog:
+        mark_and_update(board, slot, "copy", "success",
+                        f"logged via label '{vol_label or 'UNKNOWN'}' -> {t_board}:{t_slot}")
+    else:
+        mark_and_update(board, slot, "copy", "failed",
+                        f"log failed; label '{vol_label or 'UNKNOWN'}' mapped to {t_board}:{t_slot}")
+
+    send_command(port, "9")
+    time.sleep(2.0)
+    return bool(oklog)
 
 def op_format_slot(board: str, port: str, slot: int, mode: str, *, already_in_menu: bool = False) -> bool:
     if CANCEL_EVENT.is_set():
@@ -1122,8 +1256,12 @@ def retry_single(board_name: str, slot: int, mode: str) -> bool:
 
         if mode == "DATA":
             return op_data_slot(board_name, port, slot)
+        if mode == "DATA_LOG":
+            return op_data_log_slot(board_name, port, slot)
         if mode == "DATA_PREF":
             return op_data_pref_slot(board_name, port, slot)
+        if mode == "DATA_LOG_PREF":
+            return op_data_log_pref_slot(board_name, port, slot)
         if mode == "MFL":
             return op_format_slot(board_name, port, slot, "MFL")
         if mode == "MFL_PREF":
@@ -1190,6 +1328,28 @@ def process_board_parallel(board: str, port: str, selection: Optional[Dict[str, 
         finally:
             pass
 
+def process_board_data_log(board: str, port: str, selection: Optional[Dict[str, Set[int]]]) -> None:
+    if _cancelled():
+        return
+    if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+        log(f"[{board}] Port dead. Skipping board.")
+        return
+    if send_command(port, "1") is None:
+        log(f"[{board}] Could not enter slot menu; skipping board.")
+        return
+    time.sleep(0.5)
+    for slot in selected_slots_for(board, selection):
+        if _cancelled():
+            break
+        if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+            log(f"[{board}] Port dead. Skipping remaining slots.")
+            break
+        try:
+            op_data_log_slot(board, port, slot, already_in_menu=True)
+            time.sleep(0.4)
+        finally:
+            pass
+
 def process_board_data_preferred(board: str, port: str, selection: Optional[Dict[str, Set[int]]]) -> None:
     if _cancelled():
         return
@@ -1204,6 +1364,24 @@ def process_board_data_preferred(board: str, port: str, selection: Optional[Dict
             break
         try:
             op_data_pref_slot(board, port, slot)
+            time.sleep(0.4)
+        finally:
+            pass
+
+def process_board_data_log_preferred(board: str, port: str, selection: Optional[Dict[str, Set[int]]]) -> None:
+    if _cancelled():
+        return
+    if not enter_sd_menu(port, board):
+        log(f"[{board}] Could not enter SD menu; skipping board.")
+        return
+    for slot in selected_slots_for(board, selection):
+        if _cancelled():
+            break
+        if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+            log(f"[{board}] Port dead. Skipping remaining slots.")
+            break
+        try:
+            op_data_log_pref_slot(board, port, slot)
             time.sleep(0.4)
         finally:
             pass
@@ -1605,8 +1783,26 @@ def process_all_boards_with_selection(mode: str, selection: Optional[Dict[str, S
                     except Exception as e:
                         log(f"[ERROR] Worker crashed: {e}")
 
+        elif mode == "DATA_LOG":
+            with ThreadPoolExecutor(max_workers=min(8, max(1, len(selected_boards)))) as executor:
+                futures = [executor.submit(process_board_data_log, b, p, RUN_SELECTION) for b, p in selected_boards]
+                for f in as_completed(futures):
+                    if CANCEL_EVENT.is_set():
+                        break
+                    try:
+                        f.result()
+                    except Exception as e:
+                        log(f"[ERROR] Worker crashed: {e}")
+
         elif mode == "DATA_PREF":
             process_data_pref_pipelined(selected_boards, RUN_SELECTION, kick_gap_sec=2.0)
+
+        elif mode == "DATA_LOG_PREF":
+            for board, port in selected_boards:
+                if CANCEL_EVENT.is_set():
+                    break
+                process_board_data_log_preferred(board, port, RUN_SELECTION)
+                time.sleep(0.4)
 
         elif mode == "MFL":
             for board, port in selected_boards:
@@ -2109,6 +2305,8 @@ class MainWindow(QMainWindow):
         ("MFL_PREF", "9. FORMAT ALL SLOTS PREFERRED"),
         ("ODO", "10. ODO EXTRACTION"),
         ("INLB", "11. INLB EXTRACTION"),
+        ("DATA_LOG", "12. DATA EXTRACTION LOG"),
+        ("DATA_LOG_PREF", "13. DATA EXTRACTION LOG PREFERRED"),
     ]
     BOARD_TYPES = ["A-MFL", "C-MFL", "EGP"]
 
@@ -2346,6 +2544,7 @@ class MainWindow(QMainWindow):
         self.btn_sel_all.clicked.connect(lambda: self.set_all_selection(True))
         self.btn_sel_none.clicked.connect(lambda: self.set_all_selection(False))
         self.btn_sel_inv.clicked.connect(self.invert_selection)
+        self.sel_table.verticalHeader().sectionDoubleClicked.connect(self.on_sel_row_header_double_clicked)
         self.btn_quick_add.clicked.connect(self.on_quick_add)
         QtLogBridge.instance().log_signal.connect(self.on_log_line)
 
@@ -2768,6 +2967,31 @@ class MainWindow(QMainWindow):
                 if it and c < lim and (c+1) not in excluded:
                     it.setCheckState(Qt.Unchecked if it.checkState() == Qt.Checked else Qt.Checked)
 
+    def on_sel_row_header_double_clicked(self, row: int) -> None:
+        if row < 0 or row >= len(self._board_order):
+            return
+        board = self._board_order[row]
+        lim = get_slot_limit(board)
+        excluded = BOARD_EXCLUDE_SLOTS.get(board, set())
+        items = []
+        checked = 0
+        total = 0
+        for c in range(8):
+            if c >= lim or (c+1) in excluded:
+                continue
+            it = self.sel_table.item(row, c)
+            if not it:
+                continue
+            total += 1
+            if it.checkState() == Qt.Checked:
+                checked += 1
+            items.append(it)
+        if not total:
+            return
+        target = Qt.Unchecked if checked == total else Qt.Checked
+        for it in items:
+            it.setCheckState(target)
+
     def collect_selection(self) -> Dict[str, Set[int]]:
         selection: Dict[str, Set[int]] = {}
         for r, b in enumerate(self._board_order):
@@ -2885,11 +3109,11 @@ class MainWindow(QMainWindow):
 # ---------------------------- CLI ----------------------------
 def main_cli() -> None:
     print("CLI runs on all registry-detected boards/slots.")
-    choice = input("Select option (1=DATA,2=MFL,3=MFL_ALL_SLOTS,4=CMFL_ALL_SLOTS,5=LABEL,6=EGP_ALL_SLOTS,7=AUTO_FORMAT_BURN_EGP,8=DATA_PREF,9=MFL_PREF,10=ODO,11=INLB): ").strip()
+    choice = input("Select option (1=DATA,2=MFL,3=MFL_ALL_SLOTS,4=CMFL_ALL_SLOTS,5=LABEL,6=EGP_ALL_SLOTS,7=AUTO_FORMAT_BURN_EGP,8=DATA_PREF,9=MFL_PREF,10=ODO,11=INLB,12=DATA_LOG,13=DATA_LOG_PREF): ").strip()
     opt_map = {
         "1":"DATA","2":"MFL","3":"MFL_ALL_SLOTS","4":"CMFL_ALL_SLOTS",
         "5":"LABEL","6":"EGP_ALL_SLOTS","7":"AUTO_FORMAT_BURN_EGP","8":"DATA_PREF","9":"MFL_PREF",
-        "10":"ODO","11":"INLB"
+        "10":"ODO","11":"INLB","12":"DATA_LOG","13":"DATA_LOG_PREF"
     }
     mode = opt_map.get(choice, "INVALID")
     if mode == "INVALID":

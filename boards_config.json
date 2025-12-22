@@ -133,6 +133,16 @@
         3,
         5
       ]
+    },
+    "E66368254F69AD28": {
+      "name": "ODO",
+      "type": "C-MFL",
+      "exclude": []
+    },
+    "16931720": {
+      "name": "INLB",
+      "type": "C-MFL",
+      "exclude": []
     }
   }
 }
