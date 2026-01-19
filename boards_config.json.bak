@@ -227,6 +227,14 @@
       "exclude": [
         5
       ]
+    },
+    "E664B4950749232F": {
+      "name": "B8",
+      "type": "A-MFL",
+      "pipe_size": 16,
+      "exclude": [
+        5
+      ]
     }
   }
 }

@@ -224,7 +224,7 @@ class StatusTracker:
             return g("format") == "success" and g("mfl_upload") == "success"
         if option_mode == "AUTO_FORMAT_BURN_EGP":
             return g("format") == "success" and g("mfl_upload") == "success"
-        if option_mode in ("LABEL", "LABEL_PREF"):
+        if option_mode == "LABEL":
             return g("label") == "success"
         if option_mode in ("ODO", "INLB"):
             return g("special") == "success"
@@ -614,7 +614,28 @@ def get_fs_type_by_letter(drive_letter: str) -> str:
             return (p.fstype or "").strip()
     return ""
 
-def wait_for_new_drive(timeout: int = 40, expect_bootloader: bool = True) -> Optional[str]:
+def _iter_removable_partitions():
+    """
+    Yield partitions, preferring those marked as removable.
+    Falls back to all partitions if no removable flag is present.
+    """
+    parts = list(psutil.disk_partitions(all=False))
+    removable = []
+    for p in parts:
+        try:
+            opts = (getattr(p, "opts", "") or "").lower()
+            if "removable" in opts:
+                removable.append(p)
+        except Exception:
+            continue
+    return removable or parts
+
+def wait_for_new_drive(
+    timeout: int = 40,
+    expect_bootloader: bool = True,
+    initial_state: Optional[Dict[str, str]] = None,
+    debug_tag: str = "",
+) -> Optional[str]:
     if CANCEL_EVENT.is_set():
         return None
     start = time.time()
@@ -623,12 +644,26 @@ def wait_for_new_drive(timeout: int = 40, expect_bootloader: bool = True) -> Opt
             return get_drive_label(dev.strip("\\"))  # fast probe
         except Exception:
             return ""
-    initial_state = {p.device: label_of(p.device) for p in psutil.disk_partitions(all=False)}
+    if initial_state is None:
+        initial_state = {p.device: label_of(p.device) for p in _iter_removable_partitions()}
+    if debug_tag:
+        try:
+            log(f"[USB DEBUG {debug_tag}] old drives = {sorted(initial_state.keys())}")
+        except Exception:
+            pass
     while time.time() - start < timeout:
         if CANCEL_EVENT.is_set():
             return None
-        current = {p.device: label_of(p.device) for p in psutil.disk_partitions(all=False)}
+        current = {p.device: label_of(p.device) for p in _iter_removable_partitions()}
         new_drives = set(current.keys()) - set(initial_state.keys())
+
+        if debug_tag:
+            try:
+                log(f"[USB DEBUG {debug_tag}] current drives = {sorted(current.keys())}")
+                if new_drives:
+                    log(f"[USB DEBUG {debug_tag}] new drives = {sorted(new_drives)}")
+            except Exception:
+                pass
 
         for d in new_drives:
             dp = f"{d}\\"
@@ -651,6 +686,12 @@ def wait_for_new_drive(timeout: int = 40, expect_bootloader: bool = True) -> Opt
                     log(f"[USB] Bootloader appeared on existing device: {d}\\ ({up})")
                     return f"{d}\\"
             else:
+                # Special handling for LABEL_PREF: treat a label change to something
+                # like "Removable Disk" as a new SD, even if the drive letter was
+                # already present in the system.
+                if debug_tag.startswith("LABEL_PREF") and "REMOVABLE" in up and "REMOVABLE" not in prev_up:
+                    log(f"[USB] Removable data drive appeared on existing device: {d}\\ ({up}) [tag {debug_tag}]")
+                    return f"{d}\\"
                 if "RPI-RP2" not in up and "RP-DRIVE" not in up and "RPI-RP2" in prev_up:
                     log(f"[USB] Data drive appeared after RP2: {d}\\ ({up})")
                     return f"{d}\\"
@@ -670,7 +711,7 @@ def wait_for_drive_by_label(expected_labels: List[str], timeout: int = 40) -> Op
     while time.time() < end:
         if CANCEL_EVENT.is_set():
             return None
-        for p in psutil.disk_partitions(all=False):
+        for p in _iter_removable_partitions():
             root = p.device
             try:
                 lbl = (get_drive_label(root.strip("\\")) or "").strip().lower()
@@ -1265,6 +1306,18 @@ def op_label_pref_slot(board: str, port: str, slot: int) -> bool:
         mark_and_update(board, slot, "label", "failed", "port/board dead")
         return False
 
+    # Snapshot removable drives before connecting this slot so we can
+    # detect the new SD drive even if it appears very quickly.
+    try:
+        before_devs = {p.device for p in _iter_removable_partitions()}
+    except Exception:
+        before_devs = set()
+    # Debug helper: only for LABEL_PREF
+    try:
+        log(f"[{board}:{slot}] LABEL_PREF old drives = {sorted(before_devs) if before_devs else 'NONE'}")
+    except Exception:
+        pass
+
     # We are in SD-card management menu; connect this slot
     if send_command(port, str(slot)) is None:
         mark_and_update(board, slot, "label", "failed", "serial open failed (slot connect)")
@@ -1274,7 +1327,13 @@ def op_label_pref_slot(board: str, port: str, slot: int) -> bool:
     prefix = get_board_label_prefix(board)
     target_label = build_label(prefix, bidx, slot)
 
-    sd_drive = wait_for_new_drive(timeout=20, expect_bootloader=False)
+    initial_state = {d: "" for d in before_devs} if before_devs else None
+    sd_drive = wait_for_new_drive(
+        timeout=20,
+        expect_bootloader=False,
+        initial_state=initial_state,
+        debug_tag=f"LABEL_PREF {board}:{slot}",
+    )
     if not sd_drive:
         mark_and_update(board, slot, "label", "failed", "sd not detected")
         try:
@@ -1346,7 +1405,9 @@ def op_egp_burn_slot(board: str, port: str, slot: int, *, already_in_menu: bool 
     disconnect_mux(port, board)
     return bool(ok)
 
-def op_label_slot(board: str, port: str, slot: int, *, already_in_menu: bool = False) -> bool:
+def op_label_slot_classic(board: str, port: str, slot: int, *, already_in_menu: bool = False) -> bool:
+    # Original LABEL behavior: enter slot menu (1), boot DATA.uf2, and
+    # then label the SD card once it enumerates as a drive.
     if CANCEL_EVENT.is_set():
         mark_and_update(board, slot, "label", "failed", "cancelled")
         return False
@@ -1375,6 +1436,49 @@ def op_label_slot(board: str, port: str, slot: int, *, already_in_menu: bool = F
     else:
         mark_and_update(board, slot, "label", "failed", "label verify failed")
     disconnect_mux(port, board)
+    return bool(ok_lbl)
+
+def op_label_slot(board: str, port: str, slot: int, *, already_in_menu: bool = False) -> bool:
+    # LABEL now uses the SD-card menu (2 → slot) flow that was
+    # previously used only for LABEL_PREF.
+    if CANCEL_EVENT.is_set():
+        mark_and_update(board, slot, "label", "failed", "cancelled")
+        return False
+    if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+        mark_and_update(board, slot, "label", "failed", "port/board dead")
+        return False
+
+    # We assume the board is already in the SD-card management menu.
+    if send_command(port, str(slot)) is None:
+        mark_and_update(board, slot, "label", "failed", "serial open failed (slot connect)")
+        return False
+
+    bidx = board_index(board)
+    prefix = get_board_label_prefix(board)
+    target_label = build_label(prefix, bidx, slot)
+
+    sd_drive = wait_for_new_drive(timeout=20, expect_bootloader=False)
+    if not sd_drive:
+        mark_and_update(board, slot, "label", "failed", "sd not detected")
+        try:
+            send_command(port, "9")
+            time.sleep(2.0)
+        except Exception:
+            pass
+        return False
+
+    ok_lbl = enforce_label(sd_drive.strip("\\"), target_label)
+    if ok_lbl:
+        mark_and_update(board, slot, "label", "success", "")
+    else:
+        mark_and_update(board, slot, "label", "failed", "label verify failed")
+
+    try:
+        send_command(port, "9")
+        time.sleep(2.0)
+    except Exception:
+        pass
+
     return bool(ok_lbl)
 
 def retry_single(board_name: str, slot: int, mode: str) -> bool:
@@ -1423,9 +1527,9 @@ def retry_single(board_name: str, slot: int, mode: str) -> bool:
                 return False
             return op_egp_burn_slot(board_name, port, slot)
         if mode == "LABEL":
-            return op_label_slot(board_name, port, slot)
+            return op_label_slot_classic(board_name, port, slot)
         if mode == "LABEL_PREF":
-            return op_label_pref_slot(board_name, port, slot)
+            return op_label_slot(board_name, port, slot)
         return False
     finally:
         try:
@@ -1681,7 +1785,7 @@ def process_board_label_only(board: str, port: str, selection: Optional[Dict[str
             log(f"[{board}] Port dead. Skipping remaining slots.")
             break
         try:
-            op_label_slot(board, port, slot, already_in_menu=True)
+            op_label_slot_classic(board, port, slot, already_in_menu=True)
             time.sleep(0.2)
         finally:
             pass
