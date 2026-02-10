@@ -220,6 +220,8 @@ class StatusTracker:
             return g("format") == "success"
         if option_mode in ("MFL_ALL_SLOTS", "CMFL_ALL_SLOTS", "EGP_ALL_SLOTS"):
             return g("mfl_upload") == "success"
+        if option_mode == "UPLOAD_CODE":
+            return g("mfl_upload") == "success"
         if option_mode == "AUTO_FORMAT_BURN":
             return g("format") == "success" and g("mfl_upload") == "success"
         if option_mode == "AUTO_FORMAT_BURN_EGP":
@@ -1720,6 +1722,19 @@ def process_board_cmfl_all_slots(board: str, port: str, selection: Optional[Dict
         finally:
             pass
 
+def process_board_upload_code(board: str, port: str, selection: Optional[Dict[str, Set[int]]], stagger_seconds: int = 0) -> None:
+    if stagger_seconds > 0:
+        time.sleep(stagger_seconds)
+    if _cancelled():
+        return
+    btype = get_board_type(board).upper()
+    if btype == "EGP":
+        process_board_egp_all_slots(board, port, selection, stagger_seconds=0)
+    elif btype == "C-MFL":
+        process_board_cmfl_all_slots(board, port, selection, stagger_seconds=0)
+    else:
+        process_board_mfl_all_slots(board, port, selection, stagger_seconds=0)
+
 def process_board_egp_all_slots(board: str, port: str, selection: Optional[Dict[str, Set[int]]], stagger_seconds: int = 0) -> None:
     if stagger_seconds > 0:
         time.sleep(stagger_seconds)
@@ -2144,6 +2159,20 @@ def process_all_boards_with_selection(mode: str, selection: Optional[Dict[str, S
                     except Exception as e:
                         log(f"[ERROR] AUTO_EGP worker crashed: {e}")
 
+        elif mode == "UPLOAD_CODE":
+            items = selected_boards
+            with ThreadPoolExecutor(max_workers=min(8, max(1, len(items)))) as executor:
+                futures = []
+                for idx, (board, port) in enumerate(items):
+                    futures.append(executor.submit(process_board_upload_code, board, port, RUN_SELECTION, stagger_seconds=idx * 2))
+                for f in as_completed(futures):
+                    if CANCEL_EVENT.is_set():
+                        break
+                    try:
+                        f.result()
+                    except Exception as e:
+                        log(f"[ERROR] UPLOAD_CODE worker crashed: {e}")
+
         elif mode == "LABEL":
             for board, port in selected_boards:
                 if CANCEL_EVENT.is_set():
@@ -2175,12 +2204,13 @@ def process_all_boards_with_selection(mode: str, selection: Optional[Dict[str, S
 
 # ---------------------------- GUI ----------------------------
 from PyQt5.QtCore import (Qt, QThread, pyqtSignal, QTimer, QEvent, QObject, QPropertyAnimation)
+from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QTextEdit, QComboBox, QTableWidget, QTableWidgetItem,
-    QSplitter, QSizePolicy, QMessageBox, QGroupBox, QListWidget,
+    QSplitter, QSizePolicy, QMessageBox, QGroupBox, QListWidget, QListWidgetItem,
     QLineEdit, QRadioButton, QProgressBar, QAction, QMenuBar, QCheckBox,
-    QAbstractItemView, QScrollArea, QDialog, QDialogButtonBox, QFrame, QGridLayout, QSpinBox
+    QAbstractItemView, QScrollArea, QDialog, QDialogButtonBox, QFrame, QGridLayout, QSpinBox, QTabWidget, QHeaderView, QStackedLayout
 )
 
 class QtLogEvent(QEvent):
@@ -2244,24 +2274,100 @@ class SerialReaderThread(QThread):
     def stop(self):
         self._stop.set()
 
+class SerialMonitorWindow(QDialog):
+    def __init__(self, parent, port_name: str, title: str = ""):
+        super().__init__(parent)
+        self.setWindowTitle(title or f"Serial Monitor - {port_name}")
+        self.resize(750, 500)  # resizable by default
+        self.reader: Optional[SerialReaderThread] = None
+        self.port_name = port_name
+
+        v = QVBoxLayout(self)
+        top = QHBoxLayout()
+        top.addWidget(QLabel(f"Port: {port_name}"))
+        top.addStretch(1)
+        self.lbl_status = QLabel("Status: idle")
+        top.addWidget(self.lbl_status)
+        v.addLayout(top)
+
+        self.monitor = QTextEdit(); self.monitor.setReadOnly(True)
+        v.addWidget(self.monitor, 1)
+        send_row = QHBoxLayout()
+        self.send_line = QLineEdit(); self.send_line.setPlaceholderText("Enter command and press Send (CRLF)")
+        self.btn_send = QPushButton("Send")
+        send_row.addWidget(self.send_line, 1); send_row.addWidget(self.btn_send)
+        v.addLayout(send_row)
+
+        self.btn_send.clicked.connect(self.on_send)
+        self.send_line.returnPressed.connect(self.on_send)
+
+        self._start_reader()
+
+    def _start_reader(self):
+        try:
+            self.reader = SerialReaderThread(self.port_name, 115200)
+            self.reader.received.connect(self._append_text)
+            self.reader.error.connect(self._on_error)
+            self.reader.start()
+            self.lbl_status.setText(f"Status: connected to {self.port_name}")
+        except Exception as e:
+            self._append_text(f"[ERR] Failed to open {self.port_name}: {e}\n")
+            self.lbl_status.setText("Status: failed")
+
+    def _append_text(self, s: str):
+        self.monitor.moveCursor(self.monitor.textCursor().End)
+        self.monitor.insertPlainText(s)
+        self.monitor.moveCursor(self.monitor.textCursor().End)
+
+    def _on_error(self, msg: str):
+        self._append_text(f"[ERR] {msg}\n")
+        self.lbl_status.setText(f"Status: {msg}")
+
+    def on_send(self):
+        txt = self.send_line.text().strip()
+        if not txt:
+            return
+        if not self.reader or not self.reader.isRunning():
+            QMessageBox.information(self, "Send", "Not connected.")
+            return
+        try:
+            self.reader.write_line(txt)
+            self._append_text(f"> {txt}\n")
+            self.send_line.clear()
+        except Exception as e:
+            QMessageBox.warning(self, "Send", f"Failed: {e}")
+
+    def closeEvent(self, e):
+        try:
+            if self.reader:
+                self.reader.stop()
+                self.reader.wait(1500)
+        except Exception:
+            pass
+        super().closeEvent(e)
+
 class AdvancedDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Advanced Tools")
         self.resize(900, 600)
         self.reader: Optional[SerialReaderThread] = None
+        self.monitor_windows: List[SerialMonitorWindow] = []
 
         v = QVBoxLayout(self)
         top = QHBoxLayout()
         self.board_combo = QComboBox()
-        for b in sorted(BOARD_PORTS_CURRENT.keys(), key=lambda n: (board_index(n), n)):
-            self.board_combo.addItem(f"{b}  ({BOARD_PORTS_CURRENT.get(b, '?')})", b)
+        self.custom_port = QLineEdit(); self.custom_port.setPlaceholderText("Manual COM port (e.g. COM7)")
+        self.btn_refresh_ports = QPushButton("Refresh Ports")
         self.btn_connect = QPushButton("Connect")
-        self.btn_disconnect = QPushButton("Disconnect")
-        self.btn_disconnect.setEnabled(False)
+        self.btn_disconnect = QPushButton("Disconnect"); self.btn_disconnect.setEnabled(False)
+        self.btn_new_window = QPushButton("Open Monitor Window")
         self.lbl_status = QLabel("Status: idle")
-        top.addWidget(QLabel("Board:")); top.addWidget(self.board_combo, 1)
-        top.addWidget(self.btn_connect); top.addWidget(self.btn_disconnect)
+        self._refresh_ports()
+        top.addWidget(QLabel("Port:")); top.addWidget(self.board_combo, 1)
+        top.addWidget(self.custom_port, 1)
+        top.addWidget(self.btn_refresh_ports)
+        top.addWidget(self.btn_connect); top.addWidget(self.btn_disconnect); top.addWidget(self.btn_new_window)
         top.addStretch(1); top.addWidget(self.lbl_status)
         v.addLayout(top)
 
@@ -2289,14 +2395,40 @@ class AdvancedDialog(QDialog):
         self.btn_up_mfl.clicked.connect(lambda: self.on_upload(MFL_FIRMWARE))
         self.btn_up_cmfl.clicked.connect(lambda: self.on_upload(CMFL_FIRMWARE))
         self.btn_up_egp.clicked.connect(lambda: self.on_upload(EGP_FIRMWARE))
+        self.btn_refresh_ports.clicked.connect(self._refresh_ports)
+        self.btn_new_window.clicked.connect(self.on_open_monitor_window)
+
+    def _selected_port(self) -> Optional[str]:
+        manual = self.custom_port.text().strip()
+        if manual:
+            return manual
+        data = self.board_combo.currentData()
+        return data if isinstance(data, str) else None
+
+    def _refresh_ports(self):
+        current = self.board_combo.currentData()
+        self.board_combo.clear()
+        for b in sorted(BOARD_PORTS_CURRENT.keys(), key=lambda n: (board_index(n), n)):
+            port = BOARD_PORTS_CURRENT.get(b, "")
+            if port:
+                self.board_combo.addItem(f"{b} ({port})", port)
+        listed_ports = {self.board_combo.itemData(i) for i in range(self.board_combo.count())}
+        for p in serial.tools.list_ports.comports():
+            dev = p.device
+            if dev and dev not in listed_ports:
+                desc = p.description or ""
+                self.board_combo.addItem(f"{dev} (unregistered) {desc}", dev)
+        if current:
+            idx = next((i for i in range(self.board_combo.count()) if self.board_combo.itemData(i) == current), -1)
+            if idx >= 0:
+                self.board_combo.setCurrentIndex(idx)
 
     def on_connect(self):
         if self.reader and self.reader.isRunning():
             return
-        board = self.board_combo.currentData()
-        port = BOARD_PORTS_CURRENT.get(board)
+        port = self._selected_port()
         if not port:
-            QMessageBox.warning(self, "Connect", "Selected board has no COM port detected.")
+            QMessageBox.warning(self, "Connect", "Select or enter a COM port.")
             return
         self.reader = SerialReaderThread(port, 115200)
         self.reader.received.connect(self._append_text)
@@ -2331,6 +2463,25 @@ class AdvancedDialog(QDialog):
         for m in msgs:
             self._append_text(m + "\n")
         QMessageBox.information(self, "UF2 Upload", f"OK: {ok}  |  Failed: {fail}")
+
+    def on_open_monitor_window(self):
+        if len(self.monitor_windows) >= 3:
+            QMessageBox.information(self, "Monitor", "Maximum 3 monitor windows already open.")
+            return
+        port = self._selected_port()
+        if not port:
+            QMessageBox.warning(self, "Monitor", "Select or enter a COM port.")
+            return
+        dlg = SerialMonitorWindow(self, port, title=f"Serial Monitor - {port}")
+        dlg.finished.connect(lambda _: self._on_monitor_closed(dlg))
+        dlg.show()
+        self.monitor_windows.append(dlg)
+
+    def _on_monitor_closed(self, dlg: SerialMonitorWindow):
+        try:
+            self.monitor_windows.remove(dlg)
+        except ValueError:
+            pass
 
     def _append_text(self, s: str):
         self.monitor.moveCursor(self.monitor.textCursor().End)
@@ -2413,49 +2564,120 @@ class RetryThread(QThread):
 
 # ---------------------------- THEME/QSS ----------------------------
 LIGHT_QSS = """
-* { font-family: Segoe UI, Roboto, Arial; font-size: 10.5pt; }
-QMainWindow { background-color: #fafafa; }
+* { font-family: 'Segoe UI', 'Roboto', Arial; font-size: 11pt; color: #0f172a; }
+QMainWindow { background-color: #f7f7fb; }
+QTabWidget::pane { border: 0; }
 QGroupBox {
-  color: #1e293b; border: 1px solid #e2e8f0; border-radius: 12px;
-  margin-top: 12px; background-color: #ffffff;
+  border: 1px solid #d6e4ff;
+  border-radius: 12px;
+  margin-top: 20px;
+  background-color: #ffffff;
+  padding-top: 6px;
 }
-QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 2px 8px; background: #fafafa; border-radius: 8px; }
-QLabel { color: #1f2937; }
+QGroupBox::title {
+  subcontrol-origin: margin;
+  left: 12px;
+  padding: 6px 12px;
+  color: #2f5fa7;
+  background-color: #edf2ff;
+  border-radius: 10px;
+  font-weight: 800;
+  font-size: 12pt;
+  text-transform: uppercase;
+}
+QTabBar::tab {
+  background: #edf2ff;
+  color: #1f2937;
+  border: 1px solid #d6e4ff;
+  border-radius: 10px;
+  padding: 10px 16px;
+  min-width: 150px;
+  margin: 0 6px 6px 0;
+  font-weight: 700;
+}
+QTabBar::tab:selected {
+  background: #3b6fd8;
+  color: white;
+}
+QTabBar::tab:hover {
+  background: #dbeafe;
+}
+QLabel { color: #0f172a; }
 QTextEdit, QListWidget {
-  background: #ffffff; color: #111827; border: 1px solid #e5e7eb; border-radius: 10px;
+  background: #ffffff;
+  color: #111827;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  padding: 6px;
 }
 QTableWidget {
-  background: #ffffff; color: #0f172a; gridline-color: #e5e7eb; border: 1px solid #e5e7eb; border-radius: 10px;
+  background: #ffffff;
+  color: #0f172a;
+  gridline-color: #e5e7eb;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
 }
 QHeaderView::section {
-  background: #f1f5f9; color: #334155; border: 0px; padding: 6px; border-radius: 6px;
+  background: #eef2ff;
+  color: #1f2937;
+  border: 0px;
+  padding: 8px;
+  border-radius: 6px;
+  font-weight: 600;
 }
 QLineEdit, QComboBox {
-  background: #ffffff; color: #0f172a; border: 1px solid #e5e7eb; border-radius: 10px; padding: 6px;
+  background: #ffffff;
+  color: #0f172a;
+  border: 1px solid #d9e1ec;
+  border-radius: 10px;
+  padding: 8px;
 }
-QComboBox QAbstractItemView { background: #ffffff; selection-background-color: #dbeafe; color: #0f172a; border: 1px solid #e5e7eb; }
+QComboBox QAbstractItemView {
+  background: #ffffff;
+  selection-background-color: #dbeafe;
+  color: #0f172a;
+  border: 1px solid #e5e7eb;
+}
 QPushButton {
-  background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #3b82f6, stop:1 #22c55e);
-  color: white; border: 0px; border-radius: 12px; padding: 8px 14px;
+  background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #2563eb, stop:1 #22c55e);
+  color: white;
+  border: 0px;
+  border-radius: 12px;
+  padding: 10px 14px;
+  font-weight: 600;
 }
 QPushButton:hover {
-  background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #2563eb, stop:1 #16a34a);
+  background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #1d4ed8, stop:1 #16a34a);
 }
 QPushButton:disabled { background: #e5e7eb; color: #94a3b8; }
 QProgressBar {
-  background: #ffffff; border: 1px solid #e5e7eb; border-radius: 12px; text-align: center; color: #0f172a; padding: 2px;
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  text-align: center;
+  color: #0f172a;
+  padding: 2px;
 }
 QProgressBar::chunk {
   border-radius: 10px;
   background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #22c55e, stop:1 #3b82f6);
 }
-QMenuBar { background: #ffffff; color: #1f2937; border-bottom: 1px solid #e5e7eb; }
+QMenuBar { background: #ffffff; color: #2f5fa7; border-bottom: 1px solid #d6e4ff; }
 QMenuBar::item { background: transparent; padding: 6px 12px; }
-QMenuBar::item:selected { background: #e5e7eb; border-radius: 8px; }
+QMenuBar::item:selected { background: #dbeafe; border-radius: 8px; }
 QMenu {
   background: #ffffff; color: #0f172a; border: 1px solid #e5e7eb; border-radius: 10px;
 }
 QMenu::item:selected { background: #eef2ff; border-radius: 6px; }
+QDialog {
+  background: #f5f8ff;
+}
+QDialog QLabel, QDialog QGroupBox::title, QDialog QHeaderView::section {
+  color: #0b3aa3;
+}
+QDialog QTextEdit, QDialog QListWidget, QDialog QTableWidget {
+  border: 1px solid #d7defa;
+}
 """
 
 # ---------------------------- PICO & TEENSY SCANNERS ----------------------------
@@ -2574,6 +2796,165 @@ class ScrollableAbout(QDialog):
     The registry is saved to <code>boards_config.json</code> (stored beside the EXE).
     <hr>
     """
+
+# ---------------------------- SCOPE DIALOG ----------------------------
+class ScopeDialog(QDialog):
+    def __init__(self, parent: "MainWindow"):
+        super().__init__(parent)
+        self.setWindowTitle("Scope Selection & Progress")
+        self.resize(800, 600)
+        layout = QVBoxLayout(self)
+
+        # Scope controls
+        self.scope_all = QRadioButton("All boards & slots")
+        self.scope_custom = QRadioButton("Custom selection (pick boards/slot)")
+        self.scope_all.setChecked(True)
+        self.scope_all.setStyleSheet("font-weight: 700;")
+        self.scope_custom.setStyleSheet("font-weight: 700;")
+        layout.addWidget(self.scope_all)
+        layout.addWidget(self.scope_custom)
+
+        self.board_checks = QListWidget()
+        self.board_checks.setSelectionMode(QAbstractItemView.NoSelection)
+        self.board_checks.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        layout.addWidget(QLabel("Pick boards to include:"))
+        layout.addWidget(self.board_checks, 1)
+
+        slot_row = QHBoxLayout()
+        self.slot_all = QRadioButton("All slots")
+        self.slot_one = QRadioButton("Only slot:")
+        self.slot_all.setChecked(True)
+        self.slot_spin = QSpinBox(); self.slot_spin.setRange(1, 8); self.slot_spin.setEnabled(False)
+        slot_row.addWidget(self.slot_all); slot_row.addWidget(self.slot_one); slot_row.addWidget(self.slot_spin); slot_row.addStretch(1)
+        layout.addLayout(slot_row)
+
+        # Progress snapshot
+        layout.addWidget(QLabel("Progress snapshot:"))
+        self.progress_table = QTableWidget(0, 8)
+        self.progress_table.setHorizontalHeaderLabels([f"S{i}" for i in range(1, 9)])
+        self.progress_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.progress_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        layout.addWidget(self.progress_table, 2)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Close | QDialogButtonBox.Ok)
+        layout.addWidget(bb)
+
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        self.scope_custom.toggled.connect(self._toggle_custom)
+        self.slot_one.toggled.connect(self._toggle_slot)
+
+        self._parent = parent
+        self.refresh_from_parent()
+
+    def _toggle_custom(self):
+        custom = self.scope_custom.isChecked()
+        self.board_checks.setEnabled(custom)
+        self.slot_all.setEnabled(custom)
+        self.slot_one.setEnabled(custom)
+        self.slot_spin.setEnabled(custom and self.slot_one.isChecked())
+
+    def _toggle_slot(self):
+        self.slot_spin.setEnabled(self.slot_one.isChecked())
+
+    def refresh_from_parent(self):
+        self.board_checks.clear()
+        for b in sorted(BOARD_PORTS_CURRENT.keys(), key=lambda n: (board_index(n), n)):
+            item = QListWidgetItem(f"{b} ({BOARD_PORTS_CURRENT.get(b,'?')})")
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Unchecked)
+            self.board_checks.addItem(item)
+        # Pre-select from parent's EZ state
+        if getattr(self._parent, "ez_scope_custom", None) and self._parent.ez_scope_custom.isChecked():
+            self.scope_custom.setChecked(True)
+            self._toggle_custom()
+            for i in range(self.board_checks.count()):
+                it = self.board_checks.item(i)
+                name = it.text().split(" (")[0]
+                if self._parent._selection_from_ez_ui():
+                    sel = self._parent._selection_from_ez_ui()
+                    if sel and name in sel:
+                        it.setCheckState(Qt.Checked)
+            if self._parent.ez_slot_one.isChecked():
+                self.slot_one.setChecked(True)
+                self.slot_spin.setValue(self._parent.ez_slot_spin.value())
+        else:
+            self.scope_all.setChecked(True)
+            self._toggle_custom()
+            self.slot_all.setChecked(True)
+        # Progress snapshot
+        try:
+            self._parent._setup_progress_table(self.progress_table)
+            self._parent._refresh_progress_table(self.progress_table, TRACKER.snapshot(), MODE_CURRENT or self._parent.mode_combo.currentData())
+        except Exception:
+            pass
+
+    def selected_scope(self) -> Optional[Dict[str, Set[int]]]:
+        if self.scope_all.isChecked():
+            return None
+        selection: Dict[str, Set[int]] = {}
+        use_single = self.slot_one.isChecked()
+        slot_num = self.slot_spin.value()
+        for i in range(self.board_checks.count()):
+            it = self.board_checks.item(i)
+            if it and it.checkState() == Qt.Checked:
+                name = it.text().split(" (")[0]
+                lim = get_slot_limit(name)
+                excl = BOARD_EXCLUDE_SLOTS.get(name, set())
+                if use_single:
+                    if 1 <= slot_num <= lim and slot_num not in excl:
+                        selection[name] = {slot_num}
+                else:
+                    slots = {s for s in range(1, lim+1) if s not in excl}
+                    if slots:
+                        selection[name] = slots
+        return selection or None
+
+# ---------------------------- REGISTRY DIALOG ----------------------------
+class RegistryDialog(QDialog):
+    def __init__(self, parent: "MainWindow"):
+        super().__init__(parent)
+        self.parent = parent
+        self.setWindowTitle("Board Registry - Full View")
+        self.resize(1100, 700)
+
+        layout = QVBoxLayout(self)
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["Serial", "Board Name", "Type (A-MFL/C-MFL/EGP)", "Pipe size (inches)", "Exclude Slots (e.g. 2,5)"])
+        self.table.setEditTriggers(QAbstractItemView.AllEditTriggers)
+        self.table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        layout.addWidget(self.table, 1)
+
+        btn_row = QHBoxLayout()
+        self.btn_scan = QPushButton("Scan Picos")
+        self.btn_scan_teensy = QPushButton("Scan TP")
+        self.btn_add_detected = QPushButton("Add From Detected")
+        self.btn_add = QPushButton("Add Row")
+        self.btn_del = QPushButton("Delete Row")
+        self.btn_save = QPushButton("Save Registry")
+        for b in (self.btn_scan, self.btn_scan_teensy, self.btn_add_detected, self.btn_add, self.btn_del, self.btn_save):
+            btn_row.addWidget(b)
+        btn_row.addStretch(1)
+        layout.addLayout(btn_row)
+
+        self.parent._populate_registry_table(self.table)
+        self.parent._highlight_registry_matches(self.table, set(BOARD_PORTS_CURRENT.keys()))
+
+        self.btn_add.clicked.connect(lambda: self.parent._reg_add_row(self.table))
+        self.btn_del.clicked.connect(lambda: self.parent._reg_delete_row(self.table))
+        self.btn_add_detected.clicked.connect(lambda: self.parent._reg_add_from_detected(self.table))
+        self.btn_scan.clicked.connect(self.parent.on_scan_picos)
+        self.btn_scan_teensy.clicked.connect(self.parent.on_scan_teensy)
+        self.btn_save.clicked.connect(self._on_save)
+
+    def _on_save(self):
+        if self.parent._reg_save_table(self.table):
+            QMessageBox.information(self, "Registry", "Saved. Re-detecting boards.")
+            self.parent.on_detect()
+            self.parent._populate_registry_table(self.table)
+            self.parent._populate_registry_table(self.parent.reg_table)
+            self.parent._highlight_registry_matches(self.table, set(BOARD_PORTS_CURRENT.keys()))
+            self.parent._highlight_registry_matches(self.parent.reg_table, set(BOARD_PORTS_CURRENT.keys()))
 
 # ---------------------------- MAIN WINDOW ----------------------------
 class MainWindow(QMainWindow):
@@ -2733,6 +3114,7 @@ class MainWindow(QMainWindow):
         self.btn_reg_add_detected = QPushButton("Add From Detected")
         self.btn_reg_del = QPushButton("Delete Row")
         self.btn_reg_save = QPushButton("Save Registry")
+        self.btn_reg_popup = QPushButton("Open Full Window")
         reg_btn_row.addWidget(self.btn_reg_scan)
         reg_btn_row.addWidget(self.btn_reg_scan_teensy)
         reg_btn_row.addStretch(1)
@@ -2740,6 +3122,7 @@ class MainWindow(QMainWindow):
         reg_btn_row.addWidget(self.btn_reg_add)
         reg_btn_row.addWidget(self.btn_reg_del)
         reg_btn_row.addWidget(self.btn_reg_save)
+        reg_btn_row.addWidget(self.btn_reg_popup)
         reg_layout.addWidget(self.reg_table)
         reg_layout.addLayout(reg_btn_row)
         reg_group.setLayout(reg_layout)
@@ -2830,11 +3213,18 @@ class MainWindow(QMainWindow):
         self.stats_label = QLabel("Stats: –")
         bottom = QHBoxLayout(); bottom.addWidget(self.stats_label)
 
-        # Root
-        container = QWidget(); root = QVBoxLayout(container)
+        # Root for advanced page
+        adv_container = QWidget(); root = QVBoxLayout(adv_container)
         root.addWidget(splitter, 1)
         root.addLayout(bottom)
-        self.setCentralWidget(container)
+
+        # EZ page
+        ez_container = self._build_ez_page()
+
+        tabs = QTabWidget()
+        tabs.addTab(ez_container, "EZ Mode (Beginner)")
+        tabs.addTab(adv_container, "Advanced Mode")
+        self.setCentralWidget(tabs)
 
         # Wire up
         self.detect_btn.clicked.connect(self.on_detect)
@@ -2855,6 +3245,7 @@ class MainWindow(QMainWindow):
         self.btn_quick_add.clicked.connect(self.on_quick_add)
         self.cb_custom_files.toggled.connect(self.on_file_slice_toggle)
         QtLogBridge.instance().log_signal.connect(self.on_log_line)
+        QtLogBridge.instance().log_signal.connect(self.on_ez_log_line)
 
         # registry buttons
         self.btn_reg_scan.clicked.connect(self.on_scan_picos)
@@ -2863,10 +3254,12 @@ class MainWindow(QMainWindow):
         self.btn_reg_add_detected.clicked.connect(self.on_reg_add_from_detected)
         self.btn_reg_del.clicked.connect(self.on_reg_delete_row)
         self.btn_reg_save.clicked.connect(self.on_reg_save)
+        self.btn_reg_popup.clicked.connect(self._open_registry_window)
 
         # Init
         self.populate_registry_table_from_file()
         self.on_detect()
+        self._refresh_ez_boards()
         self._timer.start()
         self._prog_timer.start()
         self.on_scope_toggle()
@@ -2925,6 +3318,255 @@ class MainWindow(QMainWindow):
         if idx >= 0:
             self.mode_combo.setCurrentIndex(idx)
 
+    def _make_card(self, title: str) -> QGroupBox:
+        box = QGroupBox(title)
+        lay = QVBoxLayout()
+        lay.setContentsMargins(10, 8, 10, 10)
+        lay.setSpacing(6)
+        box.setLayout(lay)
+        return box
+
+    def on_ez_detect(self) -> None:
+        self.on_detect()
+        self._refresh_ez_boards()
+        self._rebuild_progress_tables()
+        self._refresh_ez_scope_list()
+
+    def _refresh_ez_boards(self) -> None:
+        try:
+            self.ez_boards_list.clear()
+            for b in sorted(BOARD_PORTS_CURRENT.keys(), key=lambda n: (board_index(n), n)):
+                self.ez_boards_list.addItem(f"{b} -> {BOARD_PORTS_CURRENT[b]}")
+        except Exception:
+            pass
+        self._refresh_ez_scope_list()
+
+    def _refresh_ez_scope_list(self) -> None:
+        try:
+            self.ez_board_checks.clear()
+            for b in sorted(BOARD_PORTS_CURRENT.keys(), key=lambda n: (board_index(n), n)):
+                item = QListWidgetItem(f"{b} ({BOARD_PORTS_CURRENT.get(b,'?')})")
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                item.setCheckState(Qt.Checked if self.ez_scope_custom.isChecked() else Qt.Unchecked)
+                self.ez_board_checks.addItem(item)
+        except Exception:
+            pass
+
+    def _on_ez_scope_toggle(self) -> None:
+        custom = self.ez_scope_custom.isChecked()
+        self.ez_board_checks.setEnabled(custom)
+        self.ez_slot_all.setEnabled(custom)
+        self.ez_slot_one.setEnabled(custom)
+        self.ez_slot_spin.setEnabled(custom and self.ez_slot_one.isChecked())
+
+    def _on_ez_slot_toggle(self) -> None:
+        self.ez_slot_spin.setEnabled(self.ez_slot_one.isChecked())
+
+    def on_ez_action(self, mode: str) -> None:
+        if self.engine_thread and self.engine_thread.isRunning():
+            QMessageBox.warning(self, "Busy", "A run is already in progress.")
+            return
+        if not mode:
+            QMessageBox.warning(self, "Select Action", "Choose an action to run."); return
+        if not BOARD_PORTS_CURRENT and mode not in ("ODO", "INLB"):
+            self.on_detect()
+            if not BOARD_PORTS_CURRENT:
+                QMessageBox.warning(self, "No Boards", "No boards detected."); return
+
+        selection = self._selection_from_ez_ui()
+
+        start_new_run_reset()
+        self.reset_progress_model()
+        self.refresh_views(force_clear=True)
+        self.toggle_controls(False)
+        self.toggle_ez_controls(False)
+
+        self.engine_thread = EngineThread(mode, selection)
+        self.engine_thread.finished_ok.connect(self.on_engine_finished)
+        self.engine_thread.failed.connect(self.on_engine_failed)
+        self.engine_thread.start()
+        try:
+            self.ez_tabs.setCurrentIndex(1)  # switch to Run Status tab
+        except Exception:
+            pass
+
+    def _selection_from_ez_ui(self) -> Optional[Dict[str, Set[int]]]:
+        if self.ez_scope_all.isChecked():
+            return None
+        selected_boards: Set[str] = set()
+        for i in range(self.ez_board_checks.count()):
+            it = self.ez_board_checks.item(i)
+            if it and it.checkState() == Qt.Checked:
+                name = it.text().split(" (")[0].strip()
+                if name:
+                    selected_boards.add(name)
+        if not selected_boards:
+            return None
+        selection: Dict[str, Set[int]] = {}
+        use_single_slot = self.ez_slot_one.isChecked()
+        slot_num = self.ez_slot_spin.value()
+        for b in selected_boards:
+            lim = get_slot_limit(b)
+            excl = BOARD_EXCLUDE_SLOTS.get(b, set())
+            if use_single_slot:
+                if 1 <= slot_num <= lim and slot_num not in excl:
+                    selection[b] = {slot_num}
+            else:
+                slots = {s for s in range(1, lim+1) if s not in excl}
+                if slots:
+                    selection[b] = slots
+        return selection or None
+
+    # EZ mode (beginner) page
+    def _build_ez_page(self) -> QWidget:
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(10, 10, 10, 10)
+        v.setSpacing(10)
+
+        # Actions as buttons inside a card
+        action_card = self._make_card("ACTIONS")
+        action_card.layout().setContentsMargins(12, 4, 12, 10)
+        action_layout = QGridLayout()
+        action_layout.setSpacing(10)
+        self.ez_btn_extract = QPushButton("EXTRACT PIG DATA")
+        self.ez_btn_format = QPushButton("FORMAT PIG")
+        self.ez_btn_upload = QPushButton("UPLOAD CODE")
+        self.ez_btn_odo = QPushButton("CONNECT ODOMETER TO PC")
+        self.ez_btn_inlb = QPushButton("CONNECT INLB TO PC")
+        buttons = [self.ez_btn_extract, self.ez_btn_format, self.ez_btn_upload, self.ez_btn_odo, self.ez_btn_inlb]
+        for idx, btn in enumerate(buttons):
+            btn.setMinimumWidth(170)
+            btn.setMinimumHeight(42)
+            r = idx // 3
+            c = idx % 3
+            action_layout.addWidget(btn, r, c)
+        action_card.layout().addLayout(action_layout)
+        action_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+
+        ctrl_row = QHBoxLayout()
+        self.ez_detect_btn = QPushButton("DETECT BOARDS")
+        self.ez_start_btn = QPushButton("Start")
+        self.ez_start_btn.hide()  # start handled by action buttons
+        self.ez_cancel_btn = QPushButton("ABORT")
+        self.ez_open_logs_btn = QPushButton("OPEN LOGS FOLDER")
+        for b in (self.ez_detect_btn, self.ez_open_logs_btn, self.ez_cancel_btn):
+            b.setMinimumWidth(160)
+        ctrl_row.addWidget(self.ez_detect_btn)
+        ctrl_row.addWidget(self.ez_open_logs_btn)
+        ctrl_row.addWidget(self.ez_cancel_btn)
+        ctrl_row.addStretch(1)
+
+        self.ez_progress = QProgressBar(); self.ez_progress.setMinimum(0); self.ez_progress.setMaximum(100); self.ez_progress.setValue(0)
+        self.ez_progress.setMinimumWidth(240)
+
+        # Detected boards card (always visible)
+        boards_card = self._make_card("DETECTED BOARDS")
+        boards_card.layout().setContentsMargins(12, 4, 12, 10)
+        self.ez_boards_list = QListWidget()
+        self.ez_boards_list.setMinimumHeight(180)
+        self.ez_boards_list.setStyleSheet("font-weight: 600;")
+        boards_card.layout().addWidget(self.ez_boards_list)
+        boards_card.setMinimumWidth(320)
+        boards_card.setMaximumWidth(420)
+        boards_card.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+
+        # Place actions and boards side-by-side
+        top_row = QHBoxLayout()
+        top_row.setSpacing(14)
+        top_row.addWidget(action_card, 3)
+        top_row.addWidget(boards_card, 2)
+        v.addLayout(top_row)
+        v.addLayout(ctrl_row)
+        v.addWidget(self.ez_progress)
+
+        # Ribbon content: Selection tab vs Run Status tab
+        self.ez_tabs = QTabWidget()
+        self.ez_tabs.setTabPosition(QTabWidget.North)
+
+        # Selection tab
+        sel_tab = QWidget()
+        sel_layout = QVBoxLayout(sel_tab)
+        scope_card = self._make_card("SCOPE SELECTION")
+        scope_layout = scope_card.layout()
+        self.ez_scope_all = QRadioButton("All boards & slots")
+        self.ez_scope_custom = QRadioButton("Custom selection")
+        self.ez_scope_all.setChecked(True)
+        for rb in (self.ez_scope_all, self.ez_scope_custom):
+            rb.setStyleSheet("font-weight: 700;")
+        scope_layout.addWidget(self.ez_scope_all)
+        scope_layout.addWidget(self.ez_scope_custom)
+
+        self.ez_board_checks = QListWidget()
+        self.ez_board_checks.setSelectionMode(QAbstractItemView.NoSelection)
+        self.ez_board_checks.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.ez_board_checks.setMinimumHeight(140)
+        scope_layout.addWidget(QLabel("Pick boards to include:"))
+        scope_layout.addWidget(self.ez_board_checks)
+
+        slot_row = QHBoxLayout()
+        self.ez_slot_all = QRadioButton("ALL SLOTS"); self.ez_slot_one = QRadioButton("ONLY SLOT:")
+        self.ez_slot_all.setChecked(True)
+        self.ez_slot_spin = QSpinBox(); self.ez_slot_spin.setRange(1, 8); self.ez_slot_spin.setEnabled(False)
+        slot_row.addWidget(self.ez_slot_all)
+        slot_row.addWidget(self.ez_slot_one)
+        slot_row.addWidget(self.ez_slot_spin)
+        slot_row.addStretch(1)
+        scope_layout.addLayout(slot_row)
+        sel_layout.addWidget(scope_card)
+
+        self.btn_scope_dialog = QPushButton("OPEN SELECTION WINDOW")
+        sel_layout.addWidget(self.btn_scope_dialog)
+        sel_layout.addStretch(1)
+
+        # Run Status tab
+        status_tab = QWidget()
+        status_layout = QVBoxLayout(status_tab)
+        progress_card = self._make_card("PROGRESS")
+        prog_layout = progress_card.layout()
+        prog_layout.addWidget(QLabel("<b>STATUS</b>  ✅ DONE   ❌ FAIL   ⏳ RUNNING/PENDING   × EXCLUDED   – N/A"))
+        self.ez_progress_table = QTableWidget(0, 8)
+        self.ez_progress_table.setHorizontalHeaderLabels([f"S{i}" for i in range(1, 9)])
+        self.ez_progress_table.verticalHeader().setVisible(True)
+        self.ez_progress_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.ez_progress_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.ez_progress_table.setMinimumHeight(220)
+        self.ez_progress_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        prog_layout.addWidget(self.ez_progress_table, 1)
+        status_layout.addWidget(progress_card)
+
+        summary_card = self._make_card("SUMMARY & LOGS")
+        sum_layout = summary_card.layout()
+        self.ez_simple_text = QTextEdit(); self.ez_simple_text.setReadOnly(True)
+        self.ez_simple_text.setMinimumHeight(70); self.ez_simple_text.setMaximumHeight(100)
+        sum_layout.addWidget(QLabel("Summary (boards/slots):"))
+        sum_layout.addWidget(self.ez_simple_text)
+
+        self.ez_log_text = QTextEdit(); self.ez_log_text.setReadOnly(True)
+        self.ez_log_text.setMinimumHeight(120); self.ez_log_text.setMaximumHeight(180)
+        sum_layout.addWidget(QLabel("Live Log:"))
+        sum_layout.addWidget(self.ez_log_text, 1)
+        status_layout.addWidget(summary_card)
+
+        self.ez_tabs.addTab(sel_tab, "Selection")
+        self.ez_tabs.addTab(status_tab, "Run Status")
+        v.addWidget(self.ez_tabs, 1)
+
+        self.ez_detect_btn.clicked.connect(self.on_ez_detect)
+        self.ez_cancel_btn.clicked.connect(self.on_cancel)
+        self.ez_open_logs_btn.clicked.connect(self.on_open_folder)
+        self.ez_scope_all.toggled.connect(self._on_ez_scope_toggle)
+        self.ez_slot_all.toggled.connect(self._on_ez_slot_toggle)
+        self.ez_slot_one.toggled.connect(self._on_ez_slot_toggle)
+        self.ez_btn_extract.clicked.connect(lambda: self.on_ez_action("DATA_PREF"))
+        self.ez_btn_format.clicked.connect(lambda: self.on_ez_action("MFL_PREF"))
+        self.ez_btn_upload.clicked.connect(lambda: self.on_ez_action("UPLOAD_CODE"))
+        self.ez_btn_odo.clicked.connect(lambda: self.on_ez_action("ODO"))
+        self.ez_btn_inlb.clicked.connect(lambda: self.on_ez_action("INLB"))
+        self.btn_scope_dialog.clicked.connect(self.on_open_scope_dialog)
+
+        return w
+
     # Animations
     def _animate_progress_to(self, value: int):
         value = max(0, min(100, value))
@@ -2959,65 +3601,105 @@ class MainWindow(QMainWindow):
 
     # Registry UI
     def populate_registry_table_from_file(self):
-        self.reg_table.setRowCount(0)
+        self._populate_registry_table(self.reg_table)
+        self._highlight_registry_matches(self.reg_table, set(BOARD_PORTS_CURRENT.keys()))
+
+    def _populate_registry_table(self, table: QTableWidget) -> None:
+        table.setRowCount(0)
         serial_to_board = REGISTRY.get("serial_to_board", {})
         for ser, entry in serial_to_board.items():
-            r = self.reg_table.rowCount()
-            self.reg_table.insertRow(r)
-            self.reg_table.setItem(r, 0, QTableWidgetItem(ser))
-            self.reg_table.setItem(r, 1, QTableWidgetItem(entry.get("name", "")))
-            self.reg_table.setItem(r, 2, QTableWidgetItem(entry.get("type", "C-MFL")))
+            r = table.rowCount()
+            table.insertRow(r)
+            table.setItem(r, 0, QTableWidgetItem(ser))
+            table.setItem(r, 1, QTableWidgetItem(entry.get("name", "")))
+            table.setItem(r, 2, QTableWidgetItem(entry.get("type", "C-MFL")))
             pipe_val = entry.get("pipe_size", "")
-            self.reg_table.setItem(r, 3, QTableWidgetItem(str(pipe_val) if pipe_val not in (None, "") else ""))
+            table.setItem(r, 3, QTableWidgetItem(str(pipe_val) if pipe_val not in (None, "") else ""))
             excl = entry.get("exclude", "")
             if isinstance(excl, list):
                 excl_str = ", ".join(str(x) for x in excl)
             else:
                 excl_str = str(excl or "")
-            self.reg_table.setItem(r, 4, QTableWidgetItem(excl_str))
-        self.reg_table.resizeColumnsToContents()
+            table.setItem(r, 4, QTableWidgetItem(excl_str))
+        table.resizeColumnsToContents()
+
+    def _highlight_registry_matches(self, table: QTableWidget, detected_names: Set[str]) -> None:
+        base_color = table.palette().base().color()
+        highlight_color = QColor("#d1fae5")
+        for row in range(table.rowCount()):
+            name_item = table.item(row, 1)
+            if not name_item:
+                name_item = QTableWidgetItem("")
+                table.setItem(row, 1, name_item)
+            match = name_item.text().strip() in detected_names
+            for col in range(table.columnCount()):
+                item = table.item(row, col)
+                if item is None:
+                    item = QTableWidgetItem("")
+                    table.setItem(row, col, item)
+                item.setBackground(highlight_color if match else base_color)
 
     def on_reg_add_row(self):
-        r = self.reg_table.rowCount()
-        self.reg_table.insertRow(r)
-        self.reg_table.setItem(r, 0, QTableWidgetItem(""))
-        self.reg_table.setItem(r, 1, QTableWidgetItem(f"Board_{r+1}"))
-        self.reg_table.setItem(r, 2, QTableWidgetItem("C-MFL"))
-        self.reg_table.setItem(r, 3, QTableWidgetItem(""))
-        self.reg_table.setItem(r, 4, QTableWidgetItem(""))
+        self._reg_add_row(self.reg_table)
 
     def on_reg_delete_row(self):
-        row = self.reg_table.currentRow()
-        if row >= 0:
-            self.reg_table.removeRow(row)
+        self._reg_delete_row(self.reg_table)
 
     def on_reg_add_from_detected(self):
+        self._reg_add_from_detected(self.reg_table)
+
+    def on_reg_save(self):
+        if self._reg_save_table(self.reg_table):
+            QMessageBox.information(self, "Registry", "Saved. Re-detecting boards.")
+            self.on_detect()
+
+    def on_scan_picos(self):
+        self.show_pico_list_dialog()
+
+    def on_scan_teensy(self):
+        self.show_teensy_list_dialog()
+
+    # Registry helpers (shared with pop-out dialog)
+    def _reg_add_row(self, table: QTableWidget):
+        r = table.rowCount()
+        table.insertRow(r)
+        table.setItem(r, 0, QTableWidgetItem(""))
+        table.setItem(r, 1, QTableWidgetItem(f"Board_{r+1}"))
+        table.setItem(r, 2, QTableWidgetItem("C-MFL"))
+        table.setItem(r, 3, QTableWidgetItem(""))
+        table.setItem(r, 4, QTableWidgetItem(""))
+
+    def _reg_delete_row(self, table: QTableWidget):
+        row = table.currentRow()
+        if row >= 0:
+            table.removeRow(row)
+
+    def _reg_add_from_detected(self, table: QTableWidget):
         present_serials = set()
-        for i in range(self.reg_table.rowCount()):
-            s = self.reg_table.item(i,0)
+        for i in range(table.rowCount()):
+            s = table.item(i,0)
             if s: present_serials.add(s.text().strip())
         added = 0
         for port in serial.tools.list_ports.comports():
             serno = getattr(port, "serial_number", None)
             if not serno: continue
             if serno in present_serials: continue
-            r = self.reg_table.rowCount()
-            self.reg_table.insertRow(r)
-            self.reg_table.setItem(r, 0, QTableWidgetItem(serno))
-            self.reg_table.setItem(r, 1, QTableWidgetItem(f"Board_{serno[-4:]}"))
-            # Keep default type inference simple; user can adjust.
+            r = table.rowCount()
+            table.insertRow(r)
+            table.setItem(r, 0, QTableWidgetItem(serno))
+            table.setItem(r, 1, QTableWidgetItem(f"Board_{serno[-4:]}"))
             t = "EGP" if "EGP" in (port.description or "").upper() else "C-MFL"
-            self.reg_table.setItem(r, 2, QTableWidgetItem(t))
-            self.reg_table.setItem(r, 3, QTableWidgetItem(""))
-            self.reg_table.setItem(r, 4, QTableWidgetItem(""))
+            table.setItem(r, 2, QTableWidgetItem(t))
+            table.setItem(r, 3, QTableWidgetItem(""))
+            table.setItem(r, 4, QTableWidgetItem(""))
             added += 1
         if added == 0:
             QMessageBox.information(self, "Registry", "No new connected serials found.")
 
-    def on_reg_save(self):
+    def _reg_save_table(self, table: QTableWidget) -> bool:
         serial_to_board: Dict[str, Dict] = {}
-        for i in range(self.reg_table.rowCount()):
-            s_item = self.reg_table.item(i,0); n_item = self.reg_table.item(i,1); t_item = self.reg_table.item(i,2); p_item = self.reg_table.item(i,3); e_item = self.reg_table.item(i,4)
+        for i in range(table.rowCount()):
+            s_item = table.item(i,0); n_item = table.item(i,1); t_item = table.item(i,2); p_item = table.item(i,3); e_item = table.item(i,4)
             serial = (s_item.text().strip() if s_item else "")
             name = (n_item.text().strip() if n_item else "")
             btype = (t_item.text().strip().upper() if t_item else "C-MFL")
@@ -3025,14 +3707,14 @@ class MainWindow(QMainWindow):
             excl_raw = (e_item.text().strip() if e_item else "")
             if not serial or not name:
                 QMessageBox.warning(self, "Registry", f"Row {i+1}: Serial and Name are required.")
-                return
+                return False
             if btype not in self.BOARD_TYPES:
                 QMessageBox.warning(self, "Registry", f"Row {i+1}: Type must be one of {', '.join(self.BOARD_TYPES)}.")
-                return
+                return False
             if pipe_raw:
                 if not pipe_raw.isdigit():
                     QMessageBox.warning(self, "Registry", f"Row {i+1}: Pipe size must be an integer (inches).")
-                    return
+                    return False
                 pipe_size = int(pipe_raw)
             else:
                 pipe_size = 0
@@ -3043,14 +3725,11 @@ class MainWindow(QMainWindow):
             serial_to_board[serial] = {"name": name, "type": btype, "pipe_size": pipe_size, "exclude": sorted(excl)}
         REGISTRY["serial_to_board"] = serial_to_board
         save_registry(REGISTRY)
-        QMessageBox.information(self, "Registry", "Saved. Re-detecting boards.")
-        self.on_detect()
+        return True
 
-    def on_scan_picos(self):
-        self.show_pico_list_dialog()
-
-    def on_scan_teensy(self):
-        self.show_teensy_list_dialog()
+    def _open_registry_window(self):
+        dlg = RegistryDialog(self)
+        dlg.exec_()
 
     # UI actions
     def on_detect(self) -> None:
@@ -3066,6 +3745,7 @@ class MainWindow(QMainWindow):
         self.quick_board.clear()
         for b in self._board_order:
             self.quick_board.addItem(b, b)
+        self._highlight_registry_matches(self.reg_table, set(BOARD_PORTS_CURRENT.keys()))
 
     def on_start(self) -> None:
         if self.engine_thread and self.engine_thread.isRunning():
@@ -3115,12 +3795,14 @@ class MainWindow(QMainWindow):
 
     def on_engine_finished(self) -> None:
         self.toggle_controls(True)
+        self.toggle_ez_controls(True)
         self.refresh_views()
         self.load_simple_log()
         self.refresh_progress(finalize=True)
 
     def on_engine_failed(self, err: str) -> None:
         self.toggle_controls(True)
+        self.toggle_ez_controls(True)
         self.refresh_views()
         self.load_simple_log()
         self.refresh_progress(finalize=True)
@@ -3370,6 +4052,16 @@ class MainWindow(QMainWindow):
         self.btn_reg_save.setEnabled(enabled)
         self.btn_reg_scan.setEnabled(enabled)
         self.btn_reg_scan_teensy.setEnabled(enabled)
+        self.btn_reg_popup.setEnabled(enabled)
+
+    def toggle_ez_controls(self, enabled: bool) -> None:
+        try:
+            self.ez_detect_btn.setEnabled(enabled)
+            self.ez_cancel_btn.setEnabled(not enabled or True)
+            for btn in (self.ez_btn_extract, self.ez_btn_format, self.ez_btn_upload, self.ez_btn_odo, self.ez_btn_inlb):
+                btn.setEnabled(enabled)
+        except Exception:
+            pass
 
     def clear_session_ui_tables_only(self) -> None:
         self.log_text.clear()
@@ -3377,27 +4069,49 @@ class MainWindow(QMainWindow):
         self.refresh_views(force_clear=True)
 
     def rebuild_progress_table(self) -> None:
-        self.table.setRowCount(len(self._board_order))
+        self._setup_progress_table(self.table)
+        try:
+            self._setup_progress_table(self.ez_progress_table)
+        except Exception:
+            pass
+
+    def refresh_views(self, force_clear: bool = False) -> None:
+        snap = TRACKER.snapshot()
+        mode = MODE_CURRENT or self.mode_combo.currentData()
+        self._refresh_progress_table(self.table, snap, mode)
+        try:
+            self._refresh_progress_table(self.ez_progress_table, snap, mode)
+        except Exception:
+            pass
+
+        if mode:
+            s = TRACKER.summarize(mode)
+            summary_text = f"Boards {s['boards_ok']}/{s['boards_total']} ok | Slots {s['slots_ok']}/{s['slots_total']} ok | Fail {s['slots_fail']}"
+            self.stats_label.setText(summary_text)
+            self._update_ez_summary(s)
+
+    def _setup_progress_table(self, table: QTableWidget) -> None:
+        table.setRowCount(len(self._board_order))
         for r, b in enumerate(self._board_order):
-            self.table.setVerticalHeaderItem(r, QTableWidgetItem(f"{b} [{get_board_type(b)}]"))
+            table.setVerticalHeaderItem(r, QTableWidgetItem(f"{b} [{get_board_type(b)}]"))
             lim = get_slot_limit(b)
             excluded = BOARD_EXCLUDE_SLOTS.get(b, set())
             for c in range(8):
                 sym = "–"
                 if c < lim:
                     sym = "×" if (c+1) in excluded else "⏳"
-                self.table.setItem(r, c, QTableWidgetItem(sym))
-        self.table.resizeColumnsToContents()
+                item = QTableWidgetItem(sym)
+                item.setTextAlignment(Qt.AlignCenter)
+                table.setItem(r, c, item)
+        table.resizeColumnsToContents()
 
-    def refresh_views(self, force_clear: bool = False) -> None:
-        snap = TRACKER.snapshot()
-        mode = MODE_CURRENT or self.mode_combo.currentData()
+    def _refresh_progress_table(self, table: QTableWidget, snap: Dict[str, Dict], mode: Optional[str]) -> None:
         for r, b in enumerate(self._board_order):
             lim = get_slot_limit(b)
             excluded = BOARD_EXCLUDE_SLOTS.get(b, set())
             phases_by_slot = snap.get(b, {})
             for c in range(8):
-                item = self.table.item(r, c)
+                item = table.item(r, c)
                 if c >= lim:
                     if item: item.setText("–")
                     continue
@@ -3408,29 +4122,76 @@ class MainWindow(QMainWindow):
                 phases = phases_by_slot.get(str(slot), {})
                 sym = "⏳"
                 if phases:
-                    if StatusTracker.slot_done(mode, phases):
+                    if StatusTracker.slot_done(mode or "", phases):
                         sym = "✅"
                     elif any(rec.get("status") == "failed" for rec in phases.values()):
                         sym = "❌"
                     elif any(rec.get("status") == "running" for rec in phases.values()):
                         sym = "⏳"
                 if item is None:
-                    self.table.setItem(r, c, QTableWidgetItem(sym))
+                    item = QTableWidgetItem(sym)
+                    table.setItem(r, c, item)
                 else:
                     item.setText(sym)
-        self.table.resizeColumnsToContents()
+                item.setTextAlignment(Qt.AlignCenter)
+        table.resizeColumnsToContents()
 
-        if mode:
-            s = TRACKER.summarize(mode)
-            self.stats_label.setText(
-                f"Boards {s['boards_ok']}/{s['boards_total']} ok | Slots {s['slots_ok']}/{s['slots_total']} ok | Fail {s['slots_fail']}"
-            )
+    def _rebuild_progress_tables(self) -> None:
+        self._setup_progress_table(self.table)
+        try:
+            self._setup_progress_table(self.ez_progress_table)
+        except Exception:
+            pass
 
     def reset_progress_model(self):
         global PROG_TOTAL_SLOTS, PROG_SLOTS_DONE
         PROG_TOTAL_SLOTS = 0
         PROG_SLOTS_DONE = set()
         self._animate_progress_to(0)
+        try:
+            self.ez_progress.setValue(0)
+        except Exception:
+            pass
+
+    def _update_ez_summary(self, summary: Optional[Dict[str, object]]) -> None:
+        try:
+            if not summary:
+                self.ez_simple_text.clear()
+                return
+            boards_line = f"<b style='color:#1d4ed8;'>BOARDS</b>: {summary.get('boards_ok',0)}/{summary.get('boards_total',0)} OK"
+            slots_line = f"<b style='color:#1d4ed8;'>SLOTS</b>: {summary.get('slots_ok',0)}/{summary.get('slots_total',0)} OK"
+            fail_line = f"<b style='color:#ef4444;'>FAIL</b>: {summary.get('slots_fail',0)}"
+            html = f"{boards_line} &nbsp;|&nbsp; {slots_line} &nbsp;|&nbsp; {fail_line}"
+            self.ez_simple_text.setHtml(html)
+        except Exception:
+            pass
+
+    def on_open_scope_dialog(self):
+        dlg = ScopeDialog(self)
+        if dlg.exec_() == QDialog.Accepted:
+            sel = dlg.selected_scope()
+            if sel:
+                self.ez_scope_custom.setChecked(True)
+                self._on_ez_scope_toggle()
+                # Apply selection into EZ UI
+                self._refresh_ez_scope_list()
+                for i in range(self.ez_board_checks.count()):
+                    it = self.ez_board_checks.item(i)
+                    name = it.text().split(" (")[0]
+                    if name in sel:
+                        it.setCheckState(Qt.Checked)
+                if any(len(v) == 1 for v in sel.values()):
+                    self.ez_slot_one.setChecked(True)
+                    try:
+                        sample_slot = next(iter(next(iter(sel.values()))))
+                        self.ez_slot_spin.setValue(int(sample_slot))
+                    except Exception:
+                        pass
+                else:
+                    self.ez_slot_all.setChecked(True)
+            else:
+                self.ez_scope_all.setChecked(True)
+                self._on_ez_scope_toggle()
 
     def refresh_progress(self, finalize: bool=False):
         if PROG_TOTAL_SLOTS <= 0:
@@ -3441,6 +4202,11 @@ class MainWindow(QMainWindow):
             target = 100
         if target != self.progress.value():
             self._animate_progress_to(target)
+        try:
+            if self.ez_progress.value() != target:
+                self.ez_progress.setValue(target)
+        except Exception:
+            pass
 
     def load_simple_log(self) -> None:
         try:
@@ -3452,6 +4218,12 @@ class MainWindow(QMainWindow):
 
     def on_log_line(self, line: str) -> None:
         self.log_text.append(line)
+
+    def on_ez_log_line(self, line: str) -> None:
+        try:
+            self.ez_log_text.append(line)
+        except Exception:
+            pass
 
 # ---------------------------- CLI ----------------------------
 def main_cli() -> None:
