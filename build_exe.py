@@ -28,7 +28,7 @@ import sys
 
 def main() -> None:
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    script_path = os.path.join(base_dir, "PIG_EXTRACTION_UPD.py")
+    script_path = os.path.join(base_dir, "main.py")
 
     if not os.path.exists(script_path):
         raise SystemExit(f"Could not find main script at {script_path}")
