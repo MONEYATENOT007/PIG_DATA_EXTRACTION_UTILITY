@@ -2807,26 +2807,35 @@ class ScopeDialog(QDialog):
 
         # Scope controls
         self.scope_all = QRadioButton("All boards & slots")
-        self.scope_custom = QRadioButton("Custom selection (pick boards/slot)")
+        self.scope_custom = QRadioButton("Custom selection")
         self.scope_all.setChecked(True)
         self.scope_all.setStyleSheet("font-weight: 700;")
         self.scope_custom.setStyleSheet("font-weight: 700;")
         layout.addWidget(self.scope_all)
         layout.addWidget(self.scope_custom)
 
-        self.board_checks = QListWidget()
-        self.board_checks.setSelectionMode(QAbstractItemView.NoSelection)
-        self.board_checks.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
-        layout.addWidget(QLabel("Pick boards to include:"))
-        layout.addWidget(self.board_checks, 1)
+        layout.addWidget(QLabel("Select boards/slots (– = n/a, × = excluded):"))
+        self.sel_table = QTableWidget(0, 8)
+        self.sel_table.setHorizontalHeaderLabels([f"S{i}" for i in range(1, 9)])
+        self.sel_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.sel_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.sel_table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.sel_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        try:
+            self.sel_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        except Exception:
+            pass
+        layout.addWidget(self.sel_table, 2)
 
-        slot_row = QHBoxLayout()
-        self.slot_all = QRadioButton("All slots")
-        self.slot_one = QRadioButton("Only slot:")
-        self.slot_all.setChecked(True)
-        self.slot_spin = QSpinBox(); self.slot_spin.setRange(1, 8); self.slot_spin.setEnabled(False)
-        slot_row.addWidget(self.slot_all); slot_row.addWidget(self.slot_one); slot_row.addWidget(self.slot_spin); slot_row.addStretch(1)
-        layout.addLayout(slot_row)
+        sel_btns = QHBoxLayout()
+        self.btn_scope_all = QPushButton("ALL")
+        self.btn_scope_none = QPushButton("NONE")
+        self.btn_scope_inv = QPushButton("INVERT")
+        sel_btns.addWidget(self.btn_scope_all)
+        sel_btns.addWidget(self.btn_scope_none)
+        sel_btns.addWidget(self.btn_scope_inv)
+        sel_btns.addStretch(1)
+        layout.addLayout(sel_btns)
 
         # Progress snapshot
         layout.addWidget(QLabel("Progress snapshot:"))
@@ -2842,46 +2851,51 @@ class ScopeDialog(QDialog):
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
         self.scope_custom.toggled.connect(self._toggle_custom)
-        self.slot_one.toggled.connect(self._toggle_slot)
+        self.sel_table.verticalHeader().sectionDoubleClicked.connect(self._on_row_header_double_clicked)
+        self.btn_scope_all.clicked.connect(lambda: self._set_all_selection(True))
+        self.btn_scope_none.clicked.connect(lambda: self._set_all_selection(False))
+        self.btn_scope_inv.clicked.connect(self._invert_selection)
 
         self._parent = parent
         self.refresh_from_parent()
 
     def _toggle_custom(self):
         custom = self.scope_custom.isChecked()
-        self.board_checks.setEnabled(custom)
-        self.slot_all.setEnabled(custom)
-        self.slot_one.setEnabled(custom)
-        self.slot_spin.setEnabled(custom and self.slot_one.isChecked())
-
-    def _toggle_slot(self):
-        self.slot_spin.setEnabled(self.slot_one.isChecked())
+        self.sel_table.setEnabled(custom)
+        self.btn_scope_all.setEnabled(custom)
+        self.btn_scope_none.setEnabled(custom)
+        self.btn_scope_inv.setEnabled(custom)
 
     def refresh_from_parent(self):
-        self.board_checks.clear()
-        for b in sorted(BOARD_PORTS_CURRENT.keys(), key=lambda n: (board_index(n), n)):
-            item = QListWidgetItem(f"{b} ({BOARD_PORTS_CURRENT.get(b,'?')})")
-            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-            item.setCheckState(Qt.Unchecked)
-            self.board_checks.addItem(item)
-        # Pre-select from parent's EZ state
-        if getattr(self._parent, "ez_scope_custom", None) and self._parent.ez_scope_custom.isChecked():
+        self.sel_table.setRowCount(len(self._parent._board_order))
+        try:
+            sel = self._parent._selection_from_ez_ui()
+        except Exception:
+            sel = None
+        default_checked = sel is None
+        for r, b in enumerate(self._parent._board_order):
+            self.sel_table.setVerticalHeaderItem(r, QTableWidgetItem(f"{b} [{get_board_type(b)}]"))
+            lim = get_slot_limit(b)
+            excl = BOARD_EXCLUDE_SLOTS.get(b, set())
+            for c in range(8):
+                item = QTableWidgetItem()
+                if c < lim:
+                    if (c+1) in excl:
+                        item.setFlags(Qt.ItemIsEnabled)
+                        item.setText("×")
+                    else:
+                        item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                        checked = default_checked or (sel and b in sel and (c+1) in sel[b])
+                        item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+                else:
+                    item.setFlags(Qt.ItemIsEnabled)
+                    item.setText("–")
+                self.sel_table.setItem(r, c, item)
+        if sel:
             self.scope_custom.setChecked(True)
-            self._toggle_custom()
-            for i in range(self.board_checks.count()):
-                it = self.board_checks.item(i)
-                name = it.text().split(" (")[0]
-                if self._parent._selection_from_ez_ui():
-                    sel = self._parent._selection_from_ez_ui()
-                    if sel and name in sel:
-                        it.setCheckState(Qt.Checked)
-            if self._parent.ez_slot_one.isChecked():
-                self.slot_one.setChecked(True)
-                self.slot_spin.setValue(self._parent.ez_slot_spin.value())
         else:
             self.scope_all.setChecked(True)
-            self._toggle_custom()
-            self.slot_all.setChecked(True)
+        self._toggle_custom()
         # Progress snapshot
         try:
             self._parent._setup_progress_table(self.progress_table)
@@ -2893,22 +2907,60 @@ class ScopeDialog(QDialog):
         if self.scope_all.isChecked():
             return None
         selection: Dict[str, Set[int]] = {}
-        use_single = self.slot_one.isChecked()
-        slot_num = self.slot_spin.value()
-        for i in range(self.board_checks.count()):
-            it = self.board_checks.item(i)
-            if it and it.checkState() == Qt.Checked:
-                name = it.text().split(" (")[0]
-                lim = get_slot_limit(name)
-                excl = BOARD_EXCLUDE_SLOTS.get(name, set())
-                if use_single:
-                    if 1 <= slot_num <= lim and slot_num not in excl:
-                        selection[name] = {slot_num}
-                else:
-                    slots = {s for s in range(1, lim+1) if s not in excl}
-                    if slots:
-                        selection[name] = slots
+        for r, b in enumerate(self._parent._board_order):
+            lim = get_slot_limit(b)
+            excl = BOARD_EXCLUDE_SLOTS.get(b, set())
+            slots: Set[int] = set()
+            for c in range(8):
+                it = self.sel_table.item(r, c)
+                if it and c < lim and (c+1) not in excl and it.checkState() == Qt.Checked:
+                    slots.add(c+1)
+            if slots:
+                selection[b] = slots
         return selection or None
+
+    def _on_row_header_double_clicked(self, row: int) -> None:
+        if row < 0 or row >= len(self._parent._board_order):
+            return
+        board = self._parent._board_order[row]
+        lim = get_slot_limit(board)
+        excl = BOARD_EXCLUDE_SLOTS.get(board, set())
+        items = []
+        checked = 0
+        total = 0
+        for c in range(8):
+            if c >= lim or (c+1) in excl:
+                continue
+            it = self.sel_table.item(row, c)
+            if not it:
+                continue
+            total += 1
+            if it.checkState() == Qt.Checked:
+                checked += 1
+            items.append(it)
+        if not total:
+            return
+        target = Qt.Unchecked if checked == total else Qt.Checked
+        for it in items:
+            it.setCheckState(target)
+
+    def _set_all_selection(self, checked: bool) -> None:
+        for r, b in enumerate(self._parent._board_order):
+            lim = get_slot_limit(b)
+            excl = BOARD_EXCLUDE_SLOTS.get(b, set())
+            for c in range(8):
+                it = self.sel_table.item(r, c)
+                if it and c < lim and (c+1) not in excl:
+                    it.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+
+    def _invert_selection(self) -> None:
+        for r, b in enumerate(self._parent._board_order):
+            lim = get_slot_limit(b)
+            excl = BOARD_EXCLUDE_SLOTS.get(b, set())
+            for c in range(8):
+                it = self.sel_table.item(r, c)
+                if it and c < lim and (c+1) not in excl:
+                    it.setCheckState(Qt.Unchecked if it.checkState() == Qt.Checked else Qt.Checked)
 
 # ---------------------------- REGISTRY DIALOG ----------------------------
 class RegistryDialog(QDialog):
@@ -3056,6 +3108,10 @@ class MainWindow(QMainWindow):
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        try:
+            self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        except Exception:
+            pass
 
         # Selection scope
         sel_group = QGroupBox("Scope")
@@ -3088,6 +3144,10 @@ class MainWindow(QMainWindow):
         self.sel_table.verticalHeader().setVisible(True)
         self.sel_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self.sel_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        try:
+            self.sel_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        except Exception:
+            pass
 
         sel_btns = QHBoxLayout()
         self.btn_sel_all = QPushButton("All")
@@ -3330,37 +3390,18 @@ class MainWindow(QMainWindow):
         self.on_detect()
         self._refresh_ez_boards()
         self._rebuild_progress_tables()
-        self._refresh_ez_scope_list()
 
     def _refresh_ez_boards(self) -> None:
         try:
             self.ez_boards_list.clear()
+            self.ez_quick_board.clear()
             for b in sorted(BOARD_PORTS_CURRENT.keys(), key=lambda n: (board_index(n), n)):
                 self.ez_boards_list.addItem(f"{b} -> {BOARD_PORTS_CURRENT[b]}")
+                self.ez_quick_board.addItem(b, b)
         except Exception:
             pass
-        self._refresh_ez_scope_list()
-
-    def _refresh_ez_scope_list(self) -> None:
-        try:
-            self.ez_board_checks.clear()
-            for b in sorted(BOARD_PORTS_CURRENT.keys(), key=lambda n: (board_index(n), n)):
-                item = QListWidgetItem(f"{b} ({BOARD_PORTS_CURRENT.get(b,'?')})")
-                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-                item.setCheckState(Qt.Checked if self.ez_scope_custom.isChecked() else Qt.Unchecked)
-                self.ez_board_checks.addItem(item)
-        except Exception:
-            pass
-
-    def _on_ez_scope_toggle(self) -> None:
-        custom = self.ez_scope_custom.isChecked()
-        self.ez_board_checks.setEnabled(custom)
-        self.ez_slot_all.setEnabled(custom)
-        self.ez_slot_one.setEnabled(custom)
-        self.ez_slot_spin.setEnabled(custom and self.ez_slot_one.isChecked())
-
-    def _on_ez_slot_toggle(self) -> None:
-        self.ez_slot_spin.setEnabled(self.ez_slot_one.isChecked())
+        self.ez_rebuild_selection_table(default_checked=True)
+        self.ez_on_scope_toggle()
 
     def on_ez_action(self, mode: str) -> None:
         if self.engine_thread and self.engine_thread.isRunning():
@@ -3373,7 +3414,11 @@ class MainWindow(QMainWindow):
             if not BOARD_PORTS_CURRENT:
                 QMessageBox.warning(self, "No Boards", "No boards detected."); return
 
-        selection = self._selection_from_ez_ui()
+        selection = None
+        if self.ez_rb_custom.isChecked():
+            selection = self._selection_from_ez_ui()
+            if not selection:
+                QMessageBox.warning(self, "Selection", "No boards/slots selected."); return
 
         start_new_run_reset()
         self.reset_progress_model()
@@ -3391,30 +3436,22 @@ class MainWindow(QMainWindow):
             pass
 
     def _selection_from_ez_ui(self) -> Optional[Dict[str, Set[int]]]:
-        if self.ez_scope_all.isChecked():
+        """Return EZ selection matching advanced selection table behavior."""
+        if getattr(self, "ez_rb_all", None) and self.ez_rb_all.isChecked():
             return None
-        selected_boards: Set[str] = set()
-        for i in range(self.ez_board_checks.count()):
-            it = self.ez_board_checks.item(i)
-            if it and it.checkState() == Qt.Checked:
-                name = it.text().split(" (")[0].strip()
-                if name:
-                    selected_boards.add(name)
-        if not selected_boards:
+        if not hasattr(self, "ez_sel_table"):
             return None
         selection: Dict[str, Set[int]] = {}
-        use_single_slot = self.ez_slot_one.isChecked()
-        slot_num = self.ez_slot_spin.value()
-        for b in selected_boards:
+        for r, b in enumerate(self._board_order):
             lim = get_slot_limit(b)
-            excl = BOARD_EXCLUDE_SLOTS.get(b, set())
-            if use_single_slot:
-                if 1 <= slot_num <= lim and slot_num not in excl:
-                    selection[b] = {slot_num}
-            else:
-                slots = {s for s in range(1, lim+1) if s not in excl}
-                if slots:
-                    selection[b] = slots
+            excluded = BOARD_EXCLUDE_SLOTS.get(b, set())
+            slots: Set[int] = set()
+            for c in range(8):
+                it = self.ez_sel_table.item(r, c)
+                if it and c < lim and (c+1) not in excluded and it.checkState() == Qt.Checked:
+                    slots.add(c + 1)
+            if slots:
+                selection[b] = slots
         return selection or None
 
     # EZ mode (beginner) page
@@ -3487,34 +3524,55 @@ class MainWindow(QMainWindow):
         # Selection tab
         sel_tab = QWidget()
         sel_layout = QVBoxLayout(sel_tab)
+        sel_layout.setContentsMargins(0, 0, 0, 0)
         scope_card = self._make_card("SCOPE SELECTION")
         scope_layout = scope_card.layout()
-        self.ez_scope_all = QRadioButton("All boards & slots")
-        self.ez_scope_custom = QRadioButton("Custom selection")
-        self.ez_scope_all.setChecked(True)
-        for rb in (self.ez_scope_all, self.ez_scope_custom):
+        self.ez_rb_all = QRadioButton("All detected boards")
+        self.ez_rb_custom = QRadioButton("Custom selection (Advanced style)")
+        self.ez_rb_all.setChecked(True)
+        for rb in (self.ez_rb_all, self.ez_rb_custom):
             rb.setStyleSheet("font-weight: 700;")
-        scope_layout.addWidget(self.ez_scope_all)
-        scope_layout.addWidget(self.ez_scope_custom)
+        scope_layout.addWidget(self.ez_rb_all)
+        scope_layout.addWidget(self.ez_rb_custom)
 
-        self.ez_board_checks = QListWidget()
-        self.ez_board_checks.setSelectionMode(QAbstractItemView.NoSelection)
-        self.ez_board_checks.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
-        self.ez_board_checks.setMinimumHeight(140)
-        scope_layout.addWidget(QLabel("Pick boards to include:"))
-        scope_layout.addWidget(self.ez_board_checks)
+        quick_row = QHBoxLayout()
+        self.ez_quick_board = QComboBox()
+        self.ez_quick_slot = QComboBox()
+        for i in range(1, 9):
+            self.ez_quick_slot.addItem(f"S{i}", i)
+        self.ez_btn_quick_add = QPushButton("Add")
+        quick_row.addWidget(QLabel("Quick pick:"))
+        self.ez_quick_board.setMinimumWidth(200)
+        quick_row.addWidget(self.ez_quick_board)
+        quick_row.addWidget(self.ez_quick_slot)
+        quick_row.addWidget(self.ez_btn_quick_add)
+        quick_row.addStretch(1)
+        scope_layout.addLayout(quick_row)
 
-        slot_row = QHBoxLayout()
-        self.ez_slot_all = QRadioButton("ALL SLOTS"); self.ez_slot_one = QRadioButton("ONLY SLOT:")
-        self.ez_slot_all.setChecked(True)
-        self.ez_slot_spin = QSpinBox(); self.ez_slot_spin.setRange(1, 8); self.ez_slot_spin.setEnabled(False)
-        slot_row.addWidget(self.ez_slot_all)
-        slot_row.addWidget(self.ez_slot_one)
-        slot_row.addWidget(self.ez_slot_spin)
-        slot_row.addStretch(1)
-        scope_layout.addLayout(slot_row)
+        self.ez_sel_table = QTableWidget(0, 8)
+        self.ez_sel_table.setHorizontalHeaderLabels([f"S{i}" for i in range(1, 9)])
+        self.ez_sel_table.verticalHeader().setVisible(True)
+        self.ez_sel_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.ez_sel_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.ez_sel_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        try:
+            self.ez_sel_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        except Exception:
+            pass
+        scope_layout.addWidget(QLabel("Custom: select boards and slots (grey = n/a; A- = excluded by registry)"))
+        scope_layout.addWidget(self.ez_sel_table)
+
+        sel_btns = QHBoxLayout()
+        self.ez_btn_sel_all = QPushButton("All")
+        self.ez_btn_sel_none = QPushButton("None")
+        self.ez_btn_sel_inv = QPushButton("Invert")
+        sel_btns.addWidget(self.ez_btn_sel_all)
+        sel_btns.addWidget(self.ez_btn_sel_none)
+        sel_btns.addWidget(self.ez_btn_sel_inv)
+        sel_btns.addStretch(1)
+        scope_layout.addLayout(sel_btns)
+
         sel_layout.addWidget(scope_card)
-
         self.btn_scope_dialog = QPushButton("OPEN SELECTION WINDOW")
         sel_layout.addWidget(self.btn_scope_dialog)
         sel_layout.addStretch(1)
@@ -3533,6 +3591,10 @@ class MainWindow(QMainWindow):
         self.ez_progress_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self.ez_progress_table.setMinimumHeight(220)
         self.ez_progress_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        try:
+            self.ez_progress_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        except Exception:
+            pass
         prog_layout.addWidget(self.ez_progress_table, 1)
         progress_card.setMinimumWidth(360)
 
@@ -3551,16 +3613,27 @@ class MainWindow(QMainWindow):
         status_layout.addWidget(progress_card, 1)
         status_layout.addWidget(summary_card, 2)
 
-        self.ez_tabs.addTab(sel_tab, "Selection")
-        self.ez_tabs.addTab(status_tab, "Run Status")
+        sel_scroll = QScrollArea()
+        sel_scroll.setWidget(sel_tab)
+        sel_scroll.setWidgetResizable(True)
+        status_scroll = QScrollArea()
+        status_scroll.setWidget(status_tab)
+        status_scroll.setWidgetResizable(True)
+
+        self.ez_tabs.addTab(sel_scroll, "Selection")
+        self.ez_tabs.addTab(status_scroll, "Run Status")
         v.addWidget(self.ez_tabs, 1)
 
         self.ez_detect_btn.clicked.connect(self.on_ez_detect)
         self.ez_cancel_btn.clicked.connect(self.on_cancel)
         self.ez_open_logs_btn.clicked.connect(self.on_open_folder)
-        self.ez_scope_all.toggled.connect(self._on_ez_scope_toggle)
-        self.ez_slot_all.toggled.connect(self._on_ez_slot_toggle)
-        self.ez_slot_one.toggled.connect(self._on_ez_slot_toggle)
+        self.ez_rb_all.toggled.connect(self.ez_on_scope_toggle)
+        self.ez_rb_custom.toggled.connect(self.ez_on_scope_toggle)
+        self.ez_btn_sel_all.clicked.connect(lambda: self.ez_set_all_selection(True))
+        self.ez_btn_sel_none.clicked.connect(lambda: self.ez_set_all_selection(False))
+        self.ez_btn_sel_inv.clicked.connect(self.ez_invert_selection)
+        self.ez_btn_quick_add.clicked.connect(self.ez_on_quick_add)
+        self.ez_sel_table.verticalHeader().sectionDoubleClicked.connect(self.ez_on_sel_row_header_double_clicked)
         self.ez_btn_extract.clicked.connect(lambda: self.on_ez_action("DATA_PREF"))
         self.ez_btn_format.clicked.connect(lambda: self.on_ez_action("MFL_PREF"))
         self.ez_btn_upload.clicked.connect(lambda: self.on_ez_action("UPLOAD_CODE"))
@@ -3568,7 +3641,11 @@ class MainWindow(QMainWindow):
         self.ez_btn_inlb.clicked.connect(lambda: self.on_ez_action("INLB"))
         self.btn_scope_dialog.clicked.connect(self.on_open_scope_dialog)
 
-        return w
+        outer = QScrollArea()
+        outer.setWidget(w)
+        outer.setWidgetResizable(True)
+        outer.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        return outer
 
     # Animations
     def _animate_progress_to(self, value: int):
@@ -4038,6 +4115,133 @@ class MainWindow(QMainWindow):
                 selection[b] = slots
         return selection
 
+    # EZ selection helpers (mirrors advanced selection behavior)
+    def ez_on_scope_toggle(self) -> None:
+        custom = self.ez_rb_custom.isChecked()
+        self.ez_sel_table.setEnabled(custom)
+        self.ez_btn_sel_all.setEnabled(custom)
+        self.ez_btn_sel_none.setEnabled(custom)
+        self.ez_btn_sel_inv.setEnabled(custom)
+        self.ez_quick_board.setEnabled(custom)
+        self.ez_quick_slot.setEnabled(custom)
+        self.ez_btn_quick_add.setEnabled(custom)
+
+    def ez_rebuild_selection_table(self, default_checked: bool = True) -> None:
+        if not hasattr(self, "ez_sel_table"):
+            return
+        self.ez_sel_table.setRowCount(len(self._board_order))
+        for r, b in enumerate(self._board_order):
+            self.ez_sel_table.setVerticalHeaderItem(r, QTableWidgetItem(f"{b} [{get_board_type(b)}]"))
+            lim = get_slot_limit(b)
+            excluded = BOARD_EXCLUDE_SLOTS.get(b, set())
+            for c in range(8):
+                item = QTableWidgetItem()
+                if c < lim:
+                    if (c+1) in excluded:
+                        item.setFlags(Qt.ItemIsEnabled)
+                        item.setText("×")
+                    else:
+                        item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                        item.setCheckState(Qt.Checked if default_checked else Qt.Unchecked)
+                else:
+                    item.setFlags(Qt.ItemIsEnabled)
+                    item.setText("–")
+                self.ez_sel_table.setItem(r, c, item)
+        try:
+            self.ez_sel_table.resizeColumnsToContents()
+        except Exception:
+            pass
+
+    def ez_set_all_selection(self, checked: bool) -> None:
+        for r, b in enumerate(self._board_order):
+            lim = get_slot_limit(b)
+            excluded = BOARD_EXCLUDE_SLOTS.get(b, set())
+            for c in range(8):
+                it = self.ez_sel_table.item(r, c)
+                if it and c < lim and (c+1) not in excluded:
+                    it.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+
+    def ez_invert_selection(self) -> None:
+        for r, b in enumerate(self._board_order):
+            lim = get_slot_limit(b)
+            excluded = BOARD_EXCLUDE_SLOTS.get(b, set())
+            for c in range(8):
+                it = self.ez_sel_table.item(r, c)
+                if it and c < lim and (c+1) not in excluded:
+                    it.setCheckState(Qt.Unchecked if it.checkState() == Qt.Checked else Qt.Checked)
+
+    def ez_on_sel_row_header_double_clicked(self, row: int) -> None:
+        if row < 0 or row >= len(self._board_order):
+            return
+        board = self._board_order[row]
+        lim = get_slot_limit(board)
+        excluded = BOARD_EXCLUDE_SLOTS.get(board, set())
+        items = []
+        checked = 0
+        total = 0
+        for c in range(8):
+            if c >= lim or (c+1) in excluded:
+                continue
+            it = self.ez_sel_table.item(row, c)
+            if not it:
+                continue
+            total += 1
+            if it.checkState() == Qt.Checked:
+                checked += 1
+            items.append(it)
+        if not total:
+            return
+        target = Qt.Unchecked if checked == total else Qt.Checked
+        for it in items:
+            it.setCheckState(target)
+
+    def ez_on_quick_add(self):
+        if not self._board_order:
+            return
+        self.ez_rb_custom.setChecked(True)
+        board = self.ez_quick_board.currentData()
+        lim = get_slot_limit(board)
+        slot = int(self.ez_quick_slot.currentData())
+        if slot > lim:
+            QMessageBox.information(self, "Limit", f"{board} ({get_board_type(board)}) has only {lim} slots.")
+            return
+        if slot in BOARD_EXCLUDE_SLOTS.get(board, set()):
+            QMessageBox.information(self, "Excluded", f"{board} slot {slot} is excluded.")
+            return
+        try:
+            row = self._board_order.index(board)
+            col = slot - 1
+            itm = self.ez_sel_table.item(row, col)
+            if itm is None:
+                itm = QTableWidgetItem(); itm.setFlags(itm.flags() | Qt.ItemIsUserCheckable)
+                self.ez_sel_table.setItem(row, col, itm)
+            itm.setCheckState(Qt.Checked)
+        except ValueError:
+            pass
+
+    def ez_apply_selection(self, selection: Optional[Dict[str, Set[int]]]) -> None:
+        """Apply selection onto EZ table (all checked if None)."""
+        if not hasattr(self, "ez_sel_table"):
+            return
+        default_checked = selection is None
+        self.ez_rebuild_selection_table(default_checked=default_checked)
+        if selection is None:
+            self.ez_rb_all.setChecked(True)
+            return
+        self.ez_rb_custom.setChecked(True)
+        for b, slots in selection.items():
+            if b not in self._board_order:
+                continue
+            r = self._board_order.index(b)
+            lim = get_slot_limit(b)
+            excluded = BOARD_EXCLUDE_SLOTS.get(b, set())
+            for s in slots:
+                c = s - 1
+                if 0 <= c < 8 and s <= lim and s not in excluded:
+                    it = self.ez_sel_table.item(r, c)
+                    if it:
+                        it.setCheckState(Qt.Checked)
+
     # UI helpers
     def toggle_controls(self, enabled: bool) -> None:
         self.mode_combo.setEnabled(enabled)
@@ -4173,28 +4377,8 @@ class MainWindow(QMainWindow):
         dlg = ScopeDialog(self)
         if dlg.exec_() == QDialog.Accepted:
             sel = dlg.selected_scope()
-            if sel:
-                self.ez_scope_custom.setChecked(True)
-                self._on_ez_scope_toggle()
-                # Apply selection into EZ UI
-                self._refresh_ez_scope_list()
-                for i in range(self.ez_board_checks.count()):
-                    it = self.ez_board_checks.item(i)
-                    name = it.text().split(" (")[0]
-                    if name in sel:
-                        it.setCheckState(Qt.Checked)
-                if any(len(v) == 1 for v in sel.values()):
-                    self.ez_slot_one.setChecked(True)
-                    try:
-                        sample_slot = next(iter(next(iter(sel.values()))))
-                        self.ez_slot_spin.setValue(int(sample_slot))
-                    except Exception:
-                        pass
-                else:
-                    self.ez_slot_all.setChecked(True)
-            else:
-                self.ez_scope_all.setChecked(True)
-                self._on_ez_scope_toggle()
+            self.ez_apply_selection(sel)
+            self.ez_on_scope_toggle()
 
     def refresh_progress(self, finalize: bool=False):
         if PROG_TOTAL_SLOTS <= 0:
