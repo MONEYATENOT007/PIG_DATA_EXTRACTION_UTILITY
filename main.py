@@ -110,6 +110,7 @@ BOARD_PORTS_CURRENT: Dict[str, str] = {}        # board_name -> COMx
 BOARD_TYPES_CURRENT: Dict[str, str] = {}        # board_name -> type key
 BOARD_EXCLUDE_SLOTS: Dict[str, Set[int]] = {}   # board_name -> excluded slots from registry
 BOARD_PIPE_SIZES: Dict[str, int] = {}           # board_name -> pipe size in inches
+DETECTED_SERIALS_CURRENT: Set[str] = set()      # usb serial numbers currently detected
 RUN_SELECTION: Optional[Dict[str, Set[int]]] = None
 
 BOARD_SLOT_LIMITS = {"A-MFL": 5, "C-MFL": 8, "EGP": 5}
@@ -492,6 +493,7 @@ def detect_boards() -> Dict[str, str]:
     board_types: Dict[str, str] = {}
     board_excl: Dict[str, Set[int]] = {}
     board_pipe_sizes: Dict[str, int] = {}
+    detected_serials: Set[str] = set()
 
     for port in serial.tools.list_ports.comports():
         serial_number = getattr(port, "serial_number", None)
@@ -516,15 +518,17 @@ def detect_boards() -> Dict[str, str]:
                     exclude = set()
             except Exception:
                 exclude = set()
+            detected_serials.add(serial_number)
             board_ports[name] = port.device
             board_types[name] = btype if btype in BOARD_SLOT_LIMITS else "C-MFL"
             board_excl[name] = exclude
             board_pipe_sizes[name] = pipe_size
 
-    global BOARD_TYPES_CURRENT, BOARD_EXCLUDE_SLOTS, BOARD_PIPE_SIZES
+    global BOARD_TYPES_CURRENT, BOARD_EXCLUDE_SLOTS, BOARD_PIPE_SIZES, DETECTED_SERIALS_CURRENT
     BOARD_TYPES_CURRENT = board_types
     BOARD_EXCLUDE_SLOTS = board_excl
     BOARD_PIPE_SIZES = board_pipe_sizes
+    DETECTED_SERIALS_CURRENT = detected_serials
     log(f"[INFO] Detected boards (registry-based): {board_ports}")
     return board_ports
 
@@ -2990,7 +2994,7 @@ class RegistryDialog(QDialog):
         layout.addLayout(btn_row)
 
         self.parent._populate_registry_table(self.table)
-        self.parent._highlight_registry_matches(self.table, set(BOARD_PORTS_CURRENT.keys()))
+        self.parent._highlight_registry_matches(self.table, DETECTED_SERIALS_CURRENT)
 
         self.btn_add.clicked.connect(lambda: self.parent._reg_add_row(self.table))
         self.btn_del.clicked.connect(lambda: self.parent._reg_delete_row(self.table))
@@ -3005,8 +3009,8 @@ class RegistryDialog(QDialog):
             self.parent.on_detect()
             self.parent._populate_registry_table(self.table)
             self.parent._populate_registry_table(self.parent.reg_table)
-            self.parent._highlight_registry_matches(self.table, set(BOARD_PORTS_CURRENT.keys()))
-            self.parent._highlight_registry_matches(self.parent.reg_table, set(BOARD_PORTS_CURRENT.keys()))
+            self.parent._highlight_registry_matches(self.table, DETECTED_SERIALS_CURRENT)
+            self.parent._highlight_registry_matches(self.parent.reg_table, DETECTED_SERIALS_CURRENT)
 
 # ---------------------------- MAIN WINDOW ----------------------------
 class MainWindow(QMainWindow):
@@ -3682,7 +3686,7 @@ class MainWindow(QMainWindow):
     # Registry UI
     def populate_registry_table_from_file(self):
         self._populate_registry_table(self.reg_table)
-        self._highlight_registry_matches(self.reg_table, set(BOARD_PORTS_CURRENT.keys()))
+        self._highlight_registry_matches(self.reg_table, DETECTED_SERIALS_CURRENT)
 
     def _populate_registry_table(self, table: QTableWidget) -> None:
         table.setRowCount(0)
@@ -3703,15 +3707,15 @@ class MainWindow(QMainWindow):
             table.setItem(r, 4, QTableWidgetItem(excl_str))
         table.resizeColumnsToContents()
 
-    def _highlight_registry_matches(self, table: QTableWidget, detected_names: Set[str]) -> None:
+    def _highlight_registry_matches(self, table: QTableWidget, detected_serials: Set[str]) -> None:
         base_color = table.palette().base().color()
         highlight_color = QColor("#d1fae5")
         for row in range(table.rowCount()):
-            name_item = table.item(row, 1)
-            if not name_item:
-                name_item = QTableWidgetItem("")
-                table.setItem(row, 1, name_item)
-            match = name_item.text().strip() in detected_names
+            serial_item = table.item(row, 0)
+            if not serial_item:
+                serial_item = QTableWidgetItem("")
+                table.setItem(row, 0, serial_item)
+            match = serial_item.text().strip() in detected_serials
             for col in range(table.columnCount()):
                 item = table.item(row, col)
                 if item is None:
@@ -3825,7 +3829,7 @@ class MainWindow(QMainWindow):
         self.quick_board.clear()
         for b in self._board_order:
             self.quick_board.addItem(b, b)
-        self._highlight_registry_matches(self.reg_table, set(BOARD_PORTS_CURRENT.keys()))
+        self._highlight_registry_matches(self.reg_table, DETECTED_SERIALS_CURRENT)
 
     def on_start(self) -> None:
         if self.engine_thread and self.engine_thread.isRunning():
