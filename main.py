@@ -2845,7 +2845,7 @@ class ScopeDialog(QDialog):
     def __init__(self, parent: "MainWindow"):
         super().__init__(parent)
         self.setWindowTitle("Scope Selection & Progress")
-        self.resize(800, 600)
+        self.resize(980, 760)
         layout = QVBoxLayout(self)
 
         # Scope controls
@@ -2864,11 +2864,12 @@ class ScopeDialog(QDialog):
         self.sel_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.sel_table.setSelectionMode(QAbstractItemView.NoSelection)
         self.sel_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.sel_table.setMinimumHeight(300)
         try:
             self.sel_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         except Exception:
             pass
-        layout.addWidget(self.sel_table, 2)
+        layout.addWidget(self.sel_table, 3)
 
         sel_btns = QHBoxLayout()
         self.btn_scope_all = QPushButton("ALL")
@@ -2886,7 +2887,8 @@ class ScopeDialog(QDialog):
         self.progress_table.setHorizontalHeaderLabels([f"S{i}" for i in range(1, 9)])
         self.progress_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.progress_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
-        layout.addWidget(self.progress_table, 2)
+        self.progress_table.setMinimumHeight(300)
+        layout.addWidget(self.progress_table, 3)
 
         bb = QDialogButtonBox(QDialogButtonBox.Close | QDialogButtonBox.Ok)
         layout.addWidget(bb)
@@ -3114,7 +3116,9 @@ class MainWindow(QMainWindow):
 
         # Data extraction options
         self.data_opts_group = QGroupBox("Data Extraction Options")
-        data_layout = QGridLayout()
+        data_layout = QVBoxLayout()
+        data_layout.setContentsMargins(10, 8, 10, 8)
+        data_layout.setSpacing(8)
         self.cb_custom_files = QCheckBox("Enable custom file selection (Data/Data Pref)")
         self.cb_custom_files.setToolTip("Copy only a slice of files when extracting data.")
         self.sb_skip = QSpinBox(); self.sb_skip.setRange(0, 100000); self.sb_skip.setValue(0)
@@ -3122,27 +3126,40 @@ class MainWindow(QMainWindow):
         self.sb_tail = QSpinBox(); self.sb_tail.setRange(0, 100000); self.sb_tail.setValue(0)
         for sb in (self.sb_skip, self.sb_take, self.sb_tail):
             sb.setEnabled(False)
-        data_layout.addWidget(self.cb_custom_files, 0, 0, 1, 3)
-        data_layout.addWidget(QLabel("Skip first"), 1, 0)
-        data_layout.addWidget(self.sb_skip, 1, 1)
-        data_layout.addWidget(QLabel("Copy after skip"), 2, 0)
-        data_layout.addWidget(self.sb_take, 2, 1)
-        data_layout.addWidget(QLabel("Copy from end"), 3, 0)
-        data_layout.addWidget(self.sb_tail, 3, 1)
-        data_layout.setColumnStretch(2, 1)
+        for sb in (self.sb_skip, self.sb_take, self.sb_tail):
+            sb.setMinimumWidth(90)
+        data_layout.addWidget(self.cb_custom_files)
+        slice_row = QHBoxLayout()
+        slice_row.setSpacing(14)
+        slice_row.addWidget(QLabel("Skip first"))
+        slice_row.addWidget(self.sb_skip)
+        slice_row.addWidget(QLabel("Copy after skip"))
+        slice_row.addWidget(self.sb_take)
+        slice_row.addWidget(QLabel("Copy from end"))
+        slice_row.addWidget(self.sb_tail)
+        slice_row.addStretch(1)
+        data_layout.addLayout(slice_row)
         self.data_opts_group.setLayout(data_layout)
+        self.data_opts_group.setMaximumHeight(96)
 
         # Boards list
         boards_group = QGroupBox("Detected Boards")
         boards_layout = QVBoxLayout()
+        boards_layout.setContentsMargins(10, 8, 10, 8)
         self.boards_list = QListWidget()
+        self.boards_list.setFlow(QListView.LeftToRight)
+        self.boards_list.setWrapping(True)
+        self.boards_list.setResizeMode(QListView.Adjust)
+        self.boards_list.setViewMode(QListView.ListMode)
+        self.boards_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.boards_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         self.boards_list.setVerticalScrollMode(QListWidget.ScrollPerPixel)
         self.boards_list.setUniformItemSizes(True)
-        self.boards_list.setMinimumHeight(140)
-        self.boards_list.setMaximumHeight(240)
+        self.boards_list.setMinimumHeight(90)
+        self.boards_list.setMaximumHeight(130)
         boards_layout.addWidget(self.boards_list)
         boards_group.setLayout(boards_layout)
+        boards_group.setMaximumHeight(160)
 
         # Progress table
         self.table = QTableWidget(0, 8)
@@ -3150,6 +3167,7 @@ class MainWindow(QMainWindow):
         self.table.verticalHeader().setVisible(True)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.table.setMinimumHeight(320)
         self.table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         try:
             self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -3186,6 +3204,7 @@ class MainWindow(QMainWindow):
         self.sel_table.setHorizontalHeaderLabels([f"S{i}" for i in range(1, 9)])
         self.sel_table.verticalHeader().setVisible(True)
         self.sel_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.sel_table.setMinimumHeight(260)
         self.sel_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         try:
             self.sel_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -3202,6 +3221,7 @@ class MainWindow(QMainWindow):
         sg.addWidget(self.sel_table)
         sg.addLayout(sel_btns)
         sel_group.setLayout(sg)
+        sel_group.setMinimumHeight(380)
 
         # Registry
         reg_group = QGroupBox("Board Registry (Serial → Name → Type → Exclude Slots)")
@@ -3232,13 +3252,14 @@ class MainWindow(QMainWindow):
 
         # Left column (scrollable)
         left = QVBoxLayout()
+        left.setSpacing(10)
         left.addLayout(top_row)
         left.addWidget(self.progress)
         left.addWidget(self.data_opts_group)
         left.addWidget(boards_group)
         left.addWidget(QLabel("Progress (✅ ok | ❌ fail | ⏳ pending/running | – n/a | × excluded)"))
-        left.addWidget(self.table)
-        left.addWidget(sel_group)
+        left.addWidget(self.table, 2)
+        left.addWidget(sel_group, 2)
         left.addWidget(reg_group)
         left_container = QWidget(); left_container.setLayout(left)
         left_scroll = QScrollArea()
