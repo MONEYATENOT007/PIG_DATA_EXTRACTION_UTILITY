@@ -1,6 +1,6 @@
 # file: multi_board_sd_automation_gui.py
 # Requires: PyQt5, pyserial, psutil, tqdm
-# Persisted config: boards_config.json (serial->name,type,exclude map)
+# Persisted config: boards_config.json (serial->name,type,exclude,total_slots map)
 
 import os
 import sys
@@ -42,7 +42,7 @@ def load_registry() -> Dict[str, Dict]:
                     return data
     except Exception:
         pass
-    return {"version": 3, "serial_to_board": {}}  # v2 adds "exclude", v3 adds "pipe_size"
+    return {"version": 4, "serial_to_board": {}}  # v2 adds "exclude", v3 adds "pipe_size", v4 adds "total_slots"
 
 def save_registry(reg: Dict[str, Dict]) -> None:
     try:
@@ -110,6 +110,7 @@ BOARD_PORTS_CURRENT: Dict[str, str] = {}        # board_name -> COMx
 BOARD_TYPES_CURRENT: Dict[str, str] = {}        # board_name -> type key
 BOARD_EXCLUDE_SLOTS: Dict[str, Set[int]] = {}   # board_name -> excluded slots from registry
 BOARD_PIPE_SIZES: Dict[str, int] = {}           # board_name -> pipe size in inches
+BOARD_TOTAL_SLOTS_CURRENT: Dict[str, int] = {}  # board_name -> total slots from registry
 DETECTED_SERIALS_CURRENT: Set[str] = set()      # usb serial numbers currently detected
 RUN_SELECTION: Optional[Dict[str, Set[int]]] = None
 
@@ -444,6 +445,9 @@ def get_board_type(board_name: str) -> str:
     t = BOARD_TYPES_CURRENT.get(board_name)
     return t if t in BOARD_SLOT_LIMITS else "C-MFL"
 
+def default_total_slots_for_type(board_type: str) -> int:
+    return BOARD_SLOT_LIMITS.get((board_type or "").strip().upper(), 8)
+
 def get_board_label_prefix(board_name: str) -> str:
     t = get_board_type(board_name).upper()
     if t == "EGP":
@@ -456,7 +460,10 @@ def get_slot_limit(board_name: str) -> int:
     # ODO/INLB are slot-less
     if (board_name or "").strip().upper() in {"ODO", "INLB"}:
         return 0
-    return BOARD_SLOT_LIMITS.get(get_board_type(board_name), 8)
+    slots = BOARD_TOTAL_SLOTS_CURRENT.get(board_name)
+    if slots in (5, 8):
+        return slots
+    return default_total_slots_for_type(get_board_type(board_name))
 
 def find_board_name_by_index(idx: int) -> str:
     target_default = f"Board_{idx}"
@@ -486,6 +493,19 @@ def enter_sd_menu(port: str, board: str) -> bool:
         return False
     return True
 
+def enter_pref_mode89_menu(port: str, board: str) -> bool:
+    total_slots = get_slot_limit(board)
+    slot_cfg_cmd = "36" if total_slots == 8 else "33" if total_slots == 5 else None
+    if slot_cfg_cmd is None:
+        log(f"[{board}] Invalid total slots '{total_slots}' for preferred mode 8/9 flow.")
+        return False
+    for cmd in ("0", "1", slot_cfg_cmd, "0", "2"):
+        if send_command(port, cmd) is None:
+            log(f"[{board}] Failed during preferred mode 8/9 setup (cmd={cmd}).")
+            return False
+        time.sleep(0.2)
+    return True
+
 # ---------------------------- DETECTION ----------------------------
 def detect_boards() -> Dict[str, str]:
     serial_to_board = REGISTRY.get("serial_to_board", {})
@@ -493,6 +513,7 @@ def detect_boards() -> Dict[str, str]:
     board_types: Dict[str, str] = {}
     board_excl: Dict[str, Set[int]] = {}
     board_pipe_sizes: Dict[str, int] = {}
+    board_total_slots: Dict[str, int] = {}
     detected_serials: Set[str] = set()
 
     for port in serial.tools.list_ports.comports():
@@ -508,6 +529,13 @@ def detect_boards() -> Dict[str, str]:
                 pipe_size = int(pipe_raw)
             except Exception:
                 pipe_size = 0
+            total_slots_raw = entry.get("total_slots", default_total_slots_for_type(btype))
+            try:
+                total_slots = int(total_slots_raw)
+            except Exception:
+                total_slots = default_total_slots_for_type(btype)
+            if total_slots not in (5, 8):
+                total_slots = default_total_slots_for_type(btype)
             exclude_raw = entry.get("exclude", [])
             try:
                 if isinstance(exclude_raw, str):
@@ -523,11 +551,13 @@ def detect_boards() -> Dict[str, str]:
             board_types[name] = btype if btype in BOARD_SLOT_LIMITS else "C-MFL"
             board_excl[name] = exclude
             board_pipe_sizes[name] = pipe_size
+            board_total_slots[name] = total_slots
 
-    global BOARD_TYPES_CURRENT, BOARD_EXCLUDE_SLOTS, BOARD_PIPE_SIZES, DETECTED_SERIALS_CURRENT
+    global BOARD_TYPES_CURRENT, BOARD_EXCLUDE_SLOTS, BOARD_PIPE_SIZES, BOARD_TOTAL_SLOTS_CURRENT, DETECTED_SERIALS_CURRENT
     BOARD_TYPES_CURRENT = board_types
     BOARD_EXCLUDE_SLOTS = board_excl
     BOARD_PIPE_SIZES = board_pipe_sizes
+    BOARD_TOTAL_SLOTS_CURRENT = board_total_slots
     DETECTED_SERIALS_CURRENT = detected_serials
     log(f"[INFO] Detected boards (registry-based): {board_ports}")
     return board_ports
@@ -1498,7 +1528,13 @@ def retry_single(board_name: str, slot: int, mode: str) -> bool:
         log(f"[{board_name}] Retry skipped: port dead or not found.")
         return False
     try:
-        if mode in ("DATA_PREF", "MFL_PREF", "LABEL_PREF"):
+        if mode == "DATA_PREF":
+            if not enter_pref_mode89_menu(port, board_name):
+                return False
+        elif mode == "MFL_PREF":
+            if not enter_pref_mode89_menu(port, board_name):
+                return False
+        elif mode == "LABEL_PREF":
             send_command(port, "0")
             time.sleep(0.05)
             if not enter_sd_menu(port, board_name):
@@ -1605,8 +1641,8 @@ def process_board_data_log(board: str, port: str, selection: Optional[Dict[str, 
 def process_board_data_preferred(board: str, port: str, selection: Optional[Dict[str, Set[int]]]) -> None:
     if _cancelled():
         return
-    if not enter_sd_menu(port, board):
-        log(f"[{board}] Could not enter SD menu; skipping board.")
+    if not enter_pref_mode89_menu(port, board):
+        log(f"[{board}] Could not enter preferred setup for mode 8; skipping board.")
         return
     for slot in selected_slots_for(board, selection):
         if _cancelled():
@@ -1663,8 +1699,8 @@ def process_board_format(board: str, port: str, mode: str, selection: Optional[D
 def process_board_format_preferred(board: str, port: str, selection: Optional[Dict[str, Set[int]]]) -> None:
     if _cancelled():
         return
-    if not enter_sd_menu(port, board):
-        log(f"[{board}] Could not enter SD menu; skipping board.")
+    if not enter_pref_mode89_menu(port, board):
+        log(f"[{board}] Could not enter preferred setup for mode 9; skipping board.")
         return
     for slot in selected_slots_for(board, selection):
         if _cancelled():
@@ -1839,8 +1875,8 @@ def process_data_pref_pipelined(selected_boards: List[Tuple[str, str]], selectio
         if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
             log(f"[{board}] Port dead. Skipping board.")
             continue
-        if not enter_sd_menu(port, board):
-            log(f"[{board}] Could not enter SD menu; skipping board.")
+        if not enter_pref_mode89_menu(port, board):
+            log(f"[{board}] Could not enter preferred setup for mode 8; skipping board.")
             continue
         slots = selected_slots_for(board, selection)
         states.append({
@@ -2214,7 +2250,7 @@ from PyQt5.QtWidgets import (
     QPushButton, QTextEdit, QComboBox, QTableWidget, QTableWidgetItem,
     QSplitter, QSizePolicy, QMessageBox, QGroupBox, QListWidget, QListWidgetItem,
     QLineEdit, QRadioButton, QProgressBar, QAction, QMenuBar, QCheckBox,
-    QAbstractItemView, QScrollArea, QDialog, QDialogButtonBox, QFrame, QGridLayout, QSpinBox, QTabWidget, QHeaderView, QStackedLayout
+    QAbstractItemView, QScrollArea, QDialog, QDialogButtonBox, QFrame, QGridLayout, QSpinBox, QTabWidget, QHeaderView, QStackedLayout, QListView
 )
 
 class QtLogEvent(QEvent):
@@ -2551,7 +2587,10 @@ class RetryThread(QThread):
                         break
                     p = get_port_for_board(b)
                     if p and (_norm_port(p) not in DEAD_PORTS) and not is_board_dead(b):
-                        enter_sd_menu(p, b)
+                        if self.mode in ("DATA_PREF", "MFL_PREF"):
+                            enter_pref_mode89_menu(p, b)
+                        else:
+                            enter_sd_menu(p, b)
                         time.sleep(0.05)
 
             for (board, slot) in self.tasks:
@@ -2975,8 +3014,8 @@ class RegistryDialog(QDialog):
         self.resize(1100, 700)
 
         layout = QVBoxLayout(self)
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["Serial", "Board Name", "Type (A-MFL/C-MFL/EGP)", "Pipe size (inches)", "Exclude Slots (e.g. 2,5)"])
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(["Serial", "Board Name", "Type (A-MFL/C-MFL/EGP)", "Pipe size (inches)", "Exclude Slots (e.g. 2,5)", "Total Slots"])
         self.table.setEditTriggers(QAbstractItemView.AllEditTriggers)
         self.table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         layout.addWidget(self.table, 1)
@@ -3167,8 +3206,8 @@ class MainWindow(QMainWindow):
         # Registry
         reg_group = QGroupBox("Board Registry (Serial → Name → Type → Exclude Slots)")
         reg_layout = QVBoxLayout()
-        self.reg_table = QTableWidget(0, 5)
-        self.reg_table.setHorizontalHeaderLabels(["Serial", "Board Name", "Type (A-MFL/C-MFL/EGP)", "Pipe size (inches)", "Exclude Slots (e.g. 2,5)"])
+        self.reg_table = QTableWidget(0, 6)
+        self.reg_table.setHorizontalHeaderLabels(["Serial", "Board Name", "Type (A-MFL/C-MFL/EGP)", "Pipe size (inches)", "Exclude Slots (e.g. 2,5)", "Total Slots"])
         self.reg_table.setEditTriggers(QAbstractItemView.AllEditTriggers)
         self.reg_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         reg_btn_row = QHBoxLayout()
@@ -3505,7 +3544,14 @@ class MainWindow(QMainWindow):
         boards_card = self._make_card("DETECTED BOARDS")
         boards_card.layout().setContentsMargins(12, 4, 12, 10)
         self.ez_boards_list = QListWidget()
-        self.ez_boards_list.setMinimumHeight(180)
+        self.ez_boards_list.setFlow(QListView.LeftToRight)
+        self.ez_boards_list.setWrapping(True)
+        self.ez_boards_list.setResizeMode(QListView.Adjust)
+        self.ez_boards_list.setViewMode(QListView.ListMode)
+        self.ez_boards_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.ez_boards_list.setVerticalScrollMode(QListWidget.ScrollPerPixel)
+        self.ez_boards_list.setMinimumHeight(110)
+        self.ez_boards_list.setMaximumHeight(150)
         self.ez_boards_list.setStyleSheet("font-weight: 600;")
         boards_card.layout().addWidget(self.ez_boards_list)
         boards_card.setMinimumWidth(320)
@@ -3558,6 +3604,7 @@ class MainWindow(QMainWindow):
         self.ez_sel_table.verticalHeader().setVisible(True)
         self.ez_sel_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.ez_sel_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.ez_sel_table.setMinimumHeight(320)
         self.ez_sel_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         try:
             self.ez_sel_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -3576,10 +3623,10 @@ class MainWindow(QMainWindow):
         sel_btns.addStretch(1)
         scope_layout.addLayout(sel_btns)
 
-        sel_layout.addWidget(scope_card)
+        scope_card.setMinimumHeight(430)
+        sel_layout.addWidget(scope_card, 1)
         self.btn_scope_dialog = QPushButton("OPEN SELECTION WINDOW")
         sel_layout.addWidget(self.btn_scope_dialog)
-        sel_layout.addStretch(1)
 
         # Run Status tab
         status_tab = QWidget()
@@ -3593,7 +3640,7 @@ class MainWindow(QMainWindow):
         self.ez_progress_table.verticalHeader().setVisible(True)
         self.ez_progress_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.ez_progress_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        self.ez_progress_table.setMinimumHeight(220)
+        self.ez_progress_table.setMinimumHeight(320)
         self.ez_progress_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         try:
             self.ez_progress_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -3705,6 +3752,8 @@ class MainWindow(QMainWindow):
             else:
                 excl_str = str(excl or "")
             table.setItem(r, 4, QTableWidgetItem(excl_str))
+            total_slots = entry.get("total_slots", default_total_slots_for_type(entry.get("type", "C-MFL")))
+            table.setItem(r, 5, QTableWidgetItem(str(total_slots)))
         table.resizeColumnsToContents()
 
     def _highlight_registry_matches(self, table: QTableWidget, detected_serials: Set[str]) -> None:
@@ -3752,6 +3801,7 @@ class MainWindow(QMainWindow):
         table.setItem(r, 2, QTableWidgetItem("C-MFL"))
         table.setItem(r, 3, QTableWidgetItem(""))
         table.setItem(r, 4, QTableWidgetItem(""))
+        table.setItem(r, 5, QTableWidgetItem("8"))
 
     def _reg_delete_row(self, table: QTableWidget):
         row = table.currentRow()
@@ -3776,6 +3826,7 @@ class MainWindow(QMainWindow):
             table.setItem(r, 2, QTableWidgetItem(t))
             table.setItem(r, 3, QTableWidgetItem(""))
             table.setItem(r, 4, QTableWidgetItem(""))
+            table.setItem(r, 5, QTableWidgetItem(str(default_total_slots_for_type(t))))
             added += 1
         if added == 0:
             QMessageBox.information(self, "Registry", "No new connected serials found.")
@@ -3783,12 +3834,13 @@ class MainWindow(QMainWindow):
     def _reg_save_table(self, table: QTableWidget) -> bool:
         serial_to_board: Dict[str, Dict] = {}
         for i in range(table.rowCount()):
-            s_item = table.item(i,0); n_item = table.item(i,1); t_item = table.item(i,2); p_item = table.item(i,3); e_item = table.item(i,4)
+            s_item = table.item(i,0); n_item = table.item(i,1); t_item = table.item(i,2); p_item = table.item(i,3); e_item = table.item(i,4); ts_item = table.item(i,5)
             serial = (s_item.text().strip() if s_item else "")
             name = (n_item.text().strip() if n_item else "")
             btype = (t_item.text().strip().upper() if t_item else "C-MFL")
             pipe_raw = (p_item.text().strip() if p_item else "")
             excl_raw = (e_item.text().strip() if e_item else "")
+            total_slots_raw = (ts_item.text().strip() if ts_item else "")
             if not serial or not name:
                 QMessageBox.warning(self, "Registry", f"Row {i+1}: Serial and Name are required.")
                 return False
@@ -3802,11 +3854,21 @@ class MainWindow(QMainWindow):
                 pipe_size = int(pipe_raw)
             else:
                 pipe_size = 0
+            if total_slots_raw not in {"5", "8"}:
+                QMessageBox.warning(self, "Registry", f"Row {i+1}: Total Slots must be either 5 or 8.")
+                return False
+            total_slots = int(total_slots_raw)
             try:
                 excl = {int(x) for x in re.split(r"[,\s]+", excl_raw) if x.strip().isdigit()}
             except Exception:
                 excl = set()
-            serial_to_board[serial] = {"name": name, "type": btype, "pipe_size": pipe_size, "exclude": sorted(excl)}
+            slot_cap = 0 if name.strip().upper() in {"ODO", "INLB"} else total_slots
+            invalid_excl = sorted(s for s in excl if s < 1 or s > slot_cap)
+            if invalid_excl:
+                QMessageBox.warning(self, "Registry", f"Row {i+1}: Exclude Slots contains invalid values for a {slot_cap}-slot board: {', '.join(str(x) for x in invalid_excl)}.")
+                return False
+            serial_to_board[serial] = {"name": name, "type": btype, "pipe_size": pipe_size, "exclude": sorted(excl), "total_slots": total_slots}
+        REGISTRY["version"] = 4
         REGISTRY["serial_to_board"] = serial_to_board
         save_registry(REGISTRY)
         return True
