@@ -113,8 +113,19 @@ BOARD_PIPE_SIZES: Dict[str, int] = {}           # board_name -> pipe size in inc
 BOARD_TOTAL_SLOTS_CURRENT: Dict[str, int] = {}  # board_name -> total slots from registry
 DETECTED_SERIALS_CURRENT: Set[str] = set()      # usb serial numbers currently detected
 RUN_SELECTION: Optional[Dict[str, Set[int]]] = None
+SENSOR_CHECK_SAFELOCK_PORTS: Set[str] = set()
 
 BOARD_SLOT_LIMITS = {"A-MFL": 5, "C-MFL": 8, "EGP": 5}
+SENSOR_CHECK_SAMPLE_SECONDS = 5.0
+SENSOR_CHECK_PORT_APPEAR_SECONDS = 3.0
+SENSOR_CHECK_AFTER_SELECT_DELAY_SECONDS = 0.75
+SENSOR_CHECK_BETWEEN_SLOTS_SECONDS = 1.5
+SENSOR_CHECK_EXPECTED_TMAGS = tuple(range(8))
+TMAG_LINE_RE = re.compile(
+    r"\btmag\s*([0-7])\b.*?\bx\s*[:=]?\s*(-?\d+(?:\.\d+)?).*?\by\s*[:=]?\s*(-?\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+MT_VALUE_RE = re.compile(r"(-?\d+(?:\.\d+)?)\s*mT\b", re.IGNORECASE)
 
 PROG_TOTAL_SLOTS = 0
 PROG_SLOTS_DONE: Set[Tuple[str, int]] = set()
@@ -209,6 +220,11 @@ class StatusTracker:
             self.data[board][str(slot)][phase]["status"] = status
             self.data[board][str(slot)][phase]["err"] = err
 
+    def update_phase_fields(self, board: str, slot: int, phase: str, fields: Dict[str, object]) -> None:
+        self._ensure(board, slot, phase)
+        with self._lock:
+            self.data[board][str(slot)][phase].update(fields)
+
     def snapshot(self) -> Dict[str, Dict[str, Dict[str, Dict[str, str]]]]:
         with self._lock:
             return json.loads(json.dumps(self.data))
@@ -224,6 +240,8 @@ class StatusTracker:
             return g("mfl_upload") == "success"
         if option_mode == "UPLOAD_CODE":
             return g("mfl_upload") == "success"
+        if option_mode in ("CHECK_SENSOR_MFL_CMFL", "CHECK_SENSOR_EGP"):
+            return g("sensor_check") == "success"
         if option_mode == "AUTO_FORMAT_BURN":
             return g("format") == "success" and g("mfl_upload") == "success"
         if option_mode == "AUTO_FORMAT_BURN_EGP":
@@ -354,7 +372,20 @@ def update_simple_log(board_ports: Dict[str, str], option_mode: Optional[str]) -
         for s in range(1, lim + 1):
             phases = snap.get(b, {}).get(str(s), {})
             done = StatusTracker.slot_done(option_mode, phases if isinstance(phases, dict) else {})
-            slots.append(f"{s}={'True' if done else 'False'}")
+            suffix = ""
+            if option_mode in ("CHECK_SENSOR_MFL_CMFL", "CHECK_SENSOR_EGP"):
+                rec = (phases.get("sensor_check", {}) or {}) if isinstance(phases, dict) else {}
+                tmag_status = rec.get("tmag_status") if isinstance(rec, dict) else None
+                if isinstance(tmag_status, dict) and tmag_status:
+                    parts = []
+                    for idx in SENSOR_CHECK_EXPECTED_TMAGS:
+                        name = f"tmag{idx}"
+                        item = tmag_status.get(name, {}) or {}
+                        parts.append(f"T{idx}={'OK' if item.get('ok') else 'BAD'}")
+                    suffix = "(" + ",".join(parts) + ")"
+                elif rec.get("err"):
+                    suffix = f"({rec.get('err')})"
+            slots.append(f"{s}={'True' if done else 'False'}{suffix}")
         lines.append(f"{prefix}{b}({get_board_type(b)}): " + ("  ".join(slots) if slots else "(no slots)"))
 
     summary = TRACKER.summarize(option_mode)
@@ -384,6 +415,22 @@ def _bump_progress_if_terminal(board: str, slot: int):
 
 def mark_and_update(board: str, slot: int, phase: str, status: str, err: str = "") -> None:
     TRACKER.mark(board, slot, phase, status, err)
+    try:
+        _bump_progress_if_terminal(board, slot)
+        update_simple_log(BOARD_PORTS_CURRENT, MODE_CURRENT)
+    except Exception:
+        pass
+
+def mark_sensor_check(
+    board: str,
+    slot: int,
+    status: str,
+    err: str = "",
+    tmag_status: Optional[Dict[str, Dict[str, object]]] = None,
+) -> None:
+    TRACKER.mark(board, slot, "sensor_check", status, err)
+    if tmag_status is not None:
+        TRACKER.update_phase_fields(board, slot, "sensor_check", {"tmag_status": tmag_status})
     try:
         _bump_progress_if_terminal(board, slot)
         update_simple_log(BOARD_PORTS_CURRENT, MODE_CURRENT)
@@ -602,6 +649,123 @@ def send_command(port_name: str, cmd: str) -> Optional[str]:
     except Exception as e:
         log(f"[ERROR] Serial communication failed on {port_name}: {e}")
         return None
+
+def current_serial_devices() -> Set[str]:
+    return {_norm_port(p.device) for p in serial.tools.list_ports.comports() if getattr(p, "device", None)}
+
+def wait_for_new_serial_device(
+    before: Set[str],
+    timeout_sec: float = 8.0,
+    interval: float = 0.2,
+    exclude: Optional[Set[str]] = None,
+) -> Optional[str]:
+    end = time.time() + max(0.0, timeout_sec)
+    before_norm = {_norm_port(p) for p in before}
+    exclude_norm = {_norm_port(p) for p in (exclude or set())}
+    while time.time() < end:
+        if CANCEL_EVENT.is_set():
+            return None
+        now = current_serial_devices()
+        added = sorted(now - before_norm - exclude_norm)
+        if added:
+            return added[0]
+        time.sleep(interval)
+    return None
+
+def wait_for_serial_device_gone(port_name: str, timeout_sec: float = 3.0, interval: float = 0.2) -> bool:
+    target = _norm_port(port_name)
+    end = time.time() + max(0.0, timeout_sec)
+    while time.time() < end:
+        if target not in current_serial_devices():
+            return True
+        time.sleep(interval)
+    return target not in current_serial_devices()
+
+def _norm_sensor_value(value: str) -> str:
+    try:
+        return f"{float(value):.6g}"
+    except Exception:
+        return value.strip()
+
+def parse_tmag_values(line: str) -> Optional[Tuple[int, Tuple[str, ...]]]:
+    tmag_match = re.search(r"\btmag\s*([0-7])\b", line or "", re.IGNORECASE)
+    if tmag_match:
+        mt_values = tuple(_norm_sensor_value(v) for v in MT_VALUE_RE.findall(line or ""))
+        if mt_values:
+            return int(tmag_match.group(1)), mt_values
+
+    m = TMAG_LINE_RE.search(line or "")
+    if m:
+        return int(m.group(1)), (_norm_sensor_value(m.group(2)), _norm_sensor_value(m.group(3)))
+    return None
+
+def monitor_tmag_values(port_name: str, sample_seconds: float = SENSOR_CHECK_SAMPLE_SECONDS) -> Tuple[bool, Dict[str, Dict[str, object]], List[str]]:
+    samples: Dict[int, Set[Tuple[str, ...]]] = {i: set() for i in SENSOR_CHECK_EXPECTED_TMAGS}
+    raw_lines: List[str] = []
+    end = time.time() + max(0.1, sample_seconds)
+    try:
+        with serial.Serial(port_name, 115200, timeout=0.15) as ser:
+            try:
+                ser.reset_input_buffer()
+            except Exception:
+                pass
+            while time.time() < end and not CANCEL_EVENT.is_set():
+                chunk = ser.readline()
+                if not chunk:
+                    continue
+                line = chunk.decode(errors="ignore").strip()
+                if not line:
+                    continue
+                if len(raw_lines) < 50:
+                    raw_lines.append(line)
+                parsed = parse_tmag_values(line)
+                if parsed:
+                    idx, values = parsed
+                    samples.setdefault(idx, set()).add(values)
+    except Exception as e:
+        detail = {
+            f"tmag{i}": {"ok": False, "samples": 0, "values": []}
+            for i in SENSOR_CHECK_EXPECTED_TMAGS
+        }
+        return False, detail, [f"monitor failed on {port_name}: {e}"]
+
+    detail: Dict[str, Dict[str, object]] = {}
+    all_ok = True
+    for i in SENSOR_CHECK_EXPECTED_TMAGS:
+        vals = sorted(samples.get(i, set()))
+        ok = len(vals) >= 2
+        all_ok = all_ok and ok
+        detail[f"tmag{i}"] = {
+            "ok": ok,
+            "samples": len(vals),
+            "values": [",".join(f"{item}mT" for item in v) for v in vals[:5]],
+        }
+    return all_ok, detail, raw_lines
+
+def sensor_slot_command(slot: int) -> str:
+    return str(int(slot) + 8)
+
+def sensor_recovery_firmware_for_board(board: str) -> Optional[str]:
+    btype = get_board_type(board).upper()
+    if btype == "A-MFL":
+        return MFL_FIRMWARE
+    if btype == "C-MFL":
+        return CMFL_FIRMWARE
+    return None
+
+def sensor_check_excluded_ports() -> Set[str]:
+    if SENSOR_CHECK_SAFELOCK_PORTS:
+        return set(SENSOR_CHECK_SAFELOCK_PORTS)
+    return {_norm_port(p) for p in BOARD_PORTS_CURRENT.values()}
+
+def recover_sensor_slot_firmware(board: str, port: str, slot: int) -> bool:
+    uf2_path = sensor_recovery_firmware_for_board(board)
+    if not uf2_path:
+        mark_and_update(board, slot, "mfl_upload", "failed", f"no recovery firmware for {get_board_type(board)}")
+        return False
+    log(f"[{board}:{slot}] Recovery: burning {os.path.basename(uf2_path)} because sensor COM did not appear.")
+    with BOOT_LOCK:
+        return _boot_and_upload_uf2(port, slot, uf2_path, board, "mfl_upload")
 
 def disconnect_mux(port_name: str, board_name: str) -> None:
     try:
@@ -1441,6 +1605,71 @@ def op_egp_burn_slot(board: str, port: str, slot: int, *, already_in_menu: bool 
     disconnect_mux(port, board)
     return bool(ok)
 
+def op_sensor_check_mfl_cmfl_slot(board: str, port: str, slot: int, *, already_in_menu: bool = False) -> bool:
+    if CANCEL_EVENT.is_set():
+        mark_sensor_check(board, slot, "failed", "cancelled")
+        return False
+    if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+        mark_sensor_check(board, slot, "failed", "port/board dead")
+        return False
+    if not already_in_menu:
+        if send_command(port, "0") is None:
+            mark_sensor_check(board, slot, "failed", "serial open failed")
+            return False
+        time.sleep(0.2)
+        if send_command(port, "1") is None:
+            mark_sensor_check(board, slot, "failed", "serial open failed")
+            return False
+        time.sleep(0.5)
+
+    mark_sensor_check(board, slot, "running", "")
+    slot_cmd = sensor_slot_command(slot)
+    before_ports = current_serial_devices()
+    if send_command(port, slot_cmd) is None:
+        mark_sensor_check(board, slot, "failed", "serial open failed (slot connect)")
+        return False
+    time.sleep(SENSOR_CHECK_AFTER_SELECT_DELAY_SECONDS)
+
+    sensor_port = wait_for_new_serial_device(
+        before_ports,
+        timeout_sec=SENSOR_CHECK_PORT_APPEAR_SECONDS,
+        exclude=sensor_check_excluded_ports(),
+    )
+    if not sensor_port:
+        log(f"[{board}:{slot}] No sensor COM after {SENSOR_CHECK_PORT_APPEAR_SECONDS:.0f}s; starting recovery burn.")
+        recovery_before_ports = current_serial_devices()
+        if not recover_sensor_slot_firmware(board, port, slot):
+            mark_sensor_check(board, slot, "failed", f"slot sensor COM not detected after cmd {slot_cmd}; recovery burn failed")
+            return False
+        sensor_port = wait_for_new_serial_device(
+            recovery_before_ports,
+            timeout_sec=SENSOR_CHECK_PORT_APPEAR_SECONDS,
+            exclude=sensor_check_excluded_ports(),
+        )
+        if not sensor_port:
+            mark_sensor_check(board, slot, "failed", f"slot sensor COM not detected after recovery burn")
+            return False
+
+    log(f"[{board}:{slot}] Sent sensor slot command {slot_cmd}; COM port detected: {sensor_port}. Sampling TMAG values for {SENSOR_CHECK_SAMPLE_SECONDS:.0f}s.")
+    ok, detail, raw_lines = monitor_tmag_values(sensor_port, SENSOR_CHECK_SAMPLE_SECONDS)
+    bad = [name for name, rec in detail.items() if not rec.get("ok")]
+    if raw_lines:
+        log(f"[{board}:{slot}] Sensor sample preview: {' | '.join(raw_lines[:3])}")
+    if ok:
+        mark_sensor_check(board, slot, "success", "", detail)
+        log(f"[{board}:{slot}] SENSOR CHECK OK: TMAG0-TMAG7 values varied.")
+    else:
+        err = "constant/missing values: " + ", ".join(bad)
+        mark_sensor_check(board, slot, "failed", err, detail)
+        log(f"[{board}:{slot}] SENSOR CHECK FAILED: {err}")
+
+    return ok
+
+def op_sensor_check_egp_slot(board: str, port: str, slot: int, *, already_in_menu: bool = False) -> bool:
+    mark_sensor_check(board, slot, "failed", "EGP sensor check not implemented yet")
+    log(f"[{board}:{slot}] EGP sensor check not implemented yet.")
+    return False
+
 def op_label_slot_classic(board: str, port: str, slot: int, *, already_in_menu: bool = False) -> bool:
     # Original LABEL behavior: enter slot menu (1), boot DATA.uf2, and
     # then label the SD card once it enumerates as a drive.
@@ -1558,6 +1787,10 @@ def retry_single(board_name: str, slot: int, mode: str) -> bool:
             return op_cmfl_burn_slot(board_name, port, slot)
         if mode == "EGP_ALL_SLOTS":
             return op_egp_burn_slot(board_name, port, slot)
+        if mode == "CHECK_SENSOR_MFL_CMFL":
+            return op_sensor_check_mfl_cmfl_slot(board_name, port, slot)
+        if mode == "CHECK_SENSOR_EGP":
+            return op_sensor_check_egp_slot(board_name, port, slot)
         if mode == "AUTO_FORMAT_BURN":
             ok_fmt = op_format_slot(board_name, port, slot, "MFL")
             if not ok_fmt:
@@ -1798,6 +2031,41 @@ def process_board_egp_all_slots(board: str, port: str, selection: Optional[Dict[
             time.sleep(0.25)
         finally:
             pass
+
+def process_board_sensor_check_mfl_cmfl(board: str, port: str, selection: Optional[Dict[str, Set[int]]]) -> None:
+    if _cancelled():
+        return
+    if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+        log(f"[{board}] Port dead. Skipping board.")
+        return
+    btype = get_board_type(board).upper()
+    if btype == "EGP":
+        log(f"[{board}] Skipping EGP board in MFL/CMFL sensor check mode.")
+        return
+    if send_command(port, "1") is None:
+        log(f"[{board}] Could not enter slot management menu; skipping board.")
+        return
+    time.sleep(0.5)
+    for slot in selected_slots_for(board, selection):
+        if _cancelled():
+            break
+        if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+            log(f"[{board}] Port dead. Skipping remaining slots.")
+            break
+        op_sensor_check_mfl_cmfl_slot(board, port, slot, already_in_menu=True)
+        time.sleep(SENSOR_CHECK_BETWEEN_SLOTS_SECONDS)
+
+def process_board_sensor_check_egp(board: str, port: str, selection: Optional[Dict[str, Set[int]]]) -> None:
+    if _cancelled():
+        return
+    if get_board_type(board).upper() != "EGP":
+        log(f"[{board}] Skipping non-EGP board in EGP sensor check mode.")
+        return
+    for slot in selected_slots_for(board, selection):
+        if _cancelled():
+            break
+        op_sensor_check_egp_slot(board, port, slot, already_in_menu=True)
+        time.sleep(0.1)
 
 def process_board_auto_format_and_burn(board: str, port: str, selection: Optional[Dict[str, Set[int]]], stagger_seconds: int = 0) -> None:
     if stagger_seconds > 0:
@@ -2082,18 +2350,23 @@ def _send_zero_to_selected_boards(selected_boards: List[Tuple[str, str]]) -> Non
         time.sleep(0.05)
 
 def process_all_boards_with_selection(mode: str, selection: Optional[Dict[str, Set[int]]]) -> None:
-    global MODE_CURRENT, BOARD_PORTS_CURRENT, RUN_SELECTION
+    global MODE_CURRENT, BOARD_PORTS_CURRENT, RUN_SELECTION, SENSOR_CHECK_SAFELOCK_PORTS
     start_new_run_reset()
     MODE_CURRENT = mode
     RUN_SELECTION = selection or None
 
     BOARD_PORTS_CURRENT = detect_boards()
     board_ports = BOARD_PORTS_CURRENT
+    SENSOR_CHECK_SAFELOCK_PORTS = {_norm_port(p) for p in board_ports.values()}
     update_simple_log(board_ports, MODE_CURRENT)
 
     selected_boards = list(board_ports.items())
     if RUN_SELECTION:
         selected_boards = [(b, p) for b, p in selected_boards if selected_slots_for(b, RUN_SELECTION)]
+    if mode == "CHECK_SENSOR_MFL_CMFL":
+        selected_boards = [(b, p) for b, p in selected_boards if get_board_type(b).upper() != "EGP"]
+    elif mode == "CHECK_SENSOR_EGP":
+        selected_boards = [(b, p) for b, p in selected_boards if get_board_type(b).upper() == "EGP"]
 
     set_progress_total_from_selected(selected_boards, RUN_SELECTION)
 
@@ -2169,6 +2442,20 @@ def process_all_boards_with_selection(mode: str, selection: Optional[Dict[str, S
                 if CANCEL_EVENT.is_set():
                     break
                 process_board_egp_all_slots(board, port, RUN_SELECTION, stagger_seconds=0)
+                time.sleep(0.25)
+
+        elif mode == "CHECK_SENSOR_MFL_CMFL":
+            for board, port in selected_boards:
+                if CANCEL_EVENT.is_set():
+                    break
+                process_board_sensor_check_mfl_cmfl(board, port, RUN_SELECTION)
+                time.sleep(0.25)
+
+        elif mode == "CHECK_SENSOR_EGP":
+            for board, port in selected_boards:
+                if CANCEL_EVENT.is_set():
+                    break
+                process_board_sensor_check_egp(board, port, RUN_SELECTION)
                 time.sleep(0.25)
 
         elif mode == "AUTO_FORMAT_BURN":
@@ -3070,6 +3357,8 @@ class MainWindow(QMainWindow):
         ("DATA_LOG", "12. DATA EXTRACTION LOG"),
         ("DATA_LOG_PREF", "13. DATA EXTRACTION LOG PREFERRED"),
         ("LABEL_PREF", "14. LABEL SLOTS PREFFERED"),
+        ("CHECK_SENSOR_MFL_CMFL", "15. CHECK SENSOR VALUES MFL/CMFL"),
+        ("CHECK_SENSOR_EGP", "16. CHECK SENSOR VALUES EGP"),
     ]
     BOARD_TYPES = ["A-MFL", "C-MFL", "EGP"]
 
@@ -3533,9 +3822,19 @@ class MainWindow(QMainWindow):
         self.ez_btn_extract = QPushButton("EXTRACT PIG DATA")
         self.ez_btn_format = QPushButton("FORMAT PIG")
         self.ez_btn_upload = QPushButton("UPLOAD CODE")
+        self.ez_btn_sensor_mfl = QPushButton("CHECK SENSOR VALUES MFL/CMFL")
+        self.ez_btn_sensor_egp = QPushButton("CHECK SENSOR VALUES EGP")
         self.ez_btn_odo = QPushButton("CONNECT ODOMETER TO PC")
         self.ez_btn_inlb = QPushButton("CONNECT INLB TO PC")
-        buttons = [self.ez_btn_extract, self.ez_btn_format, self.ez_btn_upload, self.ez_btn_odo, self.ez_btn_inlb]
+        buttons = [
+            self.ez_btn_extract,
+            self.ez_btn_format,
+            self.ez_btn_upload,
+            self.ez_btn_sensor_mfl,
+            self.ez_btn_sensor_egp,
+            self.ez_btn_odo,
+            self.ez_btn_inlb,
+        ]
         for idx, btn in enumerate(buttons):
             btn.setMinimumWidth(170)
             btn.setMinimumHeight(42)
@@ -3709,6 +4008,8 @@ class MainWindow(QMainWindow):
         self.ez_btn_extract.clicked.connect(lambda: self.on_ez_action("DATA_PREF"))
         self.ez_btn_format.clicked.connect(lambda: self.on_ez_action("MFL_PREF"))
         self.ez_btn_upload.clicked.connect(lambda: self.on_ez_action("UPLOAD_CODE"))
+        self.ez_btn_sensor_mfl.clicked.connect(lambda: self.on_ez_action("CHECK_SENSOR_MFL_CMFL"))
+        self.ez_btn_sensor_egp.clicked.connect(lambda: self.on_ez_action("CHECK_SENSOR_EGP"))
         self.ez_btn_odo.clicked.connect(lambda: self.on_ez_action("ODO"))
         self.ez_btn_inlb.clicked.connect(lambda: self.on_ez_action("INLB"))
         self.btn_scope_dialog.clicked.connect(self.on_open_scope_dialog)
@@ -3900,8 +4201,9 @@ class MainWindow(QMainWindow):
 
     # UI actions
     def on_detect(self) -> None:
-        global BOARD_PORTS_CURRENT
+        global BOARD_PORTS_CURRENT, SENSOR_CHECK_SAFELOCK_PORTS
         BOARD_PORTS_CURRENT = detect_boards()
+        SENSOR_CHECK_SAFELOCK_PORTS = {_norm_port(p) for p in BOARD_PORTS_CURRENT.values()}
         self._board_order = sorted(BOARD_PORTS_CURRENT.keys(), key=lambda n: (board_index(n), n))
         self.boards_list.clear()
         for b in self._board_order:
@@ -4352,7 +4654,15 @@ class MainWindow(QMainWindow):
         try:
             self.ez_detect_btn.setEnabled(enabled)
             self.ez_cancel_btn.setEnabled(not enabled or True)
-            for btn in (self.ez_btn_extract, self.ez_btn_format, self.ez_btn_upload, self.ez_btn_odo, self.ez_btn_inlb):
+            for btn in (
+                self.ez_btn_extract,
+                self.ez_btn_format,
+                self.ez_btn_upload,
+                self.ez_btn_sensor_mfl,
+                self.ez_btn_sensor_egp,
+                self.ez_btn_odo,
+                self.ez_btn_inlb,
+            ):
                 btn.setEnabled(enabled)
         except Exception:
             pass
@@ -4502,11 +4812,12 @@ class MainWindow(QMainWindow):
 # ---------------------------- CLI ----------------------------
 def main_cli() -> None:
     print("CLI runs on all registry-detected boards/slots.")
-    choice = input("Select option (1=DATA,2=MFL,3=MFL_ALL_SLOTS,4=CMFL_ALL_SLOTS,5=LABEL,6=EGP_ALL_SLOTS,7=AUTO_FORMAT_BURN_EGP,8=DATA_PREF,9=MFL_PREF,10=ODO,11=INLB,12=DATA_LOG,13=DATA_LOG_PREF,14=LABEL_PREF): ").strip()
+    choice = input("Select option (1=DATA,2=MFL,3=MFL_ALL_SLOTS,4=CMFL_ALL_SLOTS,5=LABEL,6=EGP_ALL_SLOTS,7=AUTO_FORMAT_BURN_EGP,8=DATA_PREF,9=MFL_PREF,10=ODO,11=INLB,12=DATA_LOG,13=DATA_LOG_PREF,14=LABEL_PREF,15=CHECK_SENSOR_MFL_CMFL,16=CHECK_SENSOR_EGP): ").strip()
     opt_map = {
         "1":"DATA","2":"MFL","3":"MFL_ALL_SLOTS","4":"CMFL_ALL_SLOTS",
         "5":"LABEL","6":"EGP_ALL_SLOTS","7":"AUTO_FORMAT_BURN_EGP","8":"DATA_PREF","9":"MFL_PREF",
-        "10":"ODO","11":"INLB","12":"DATA_LOG","13":"DATA_LOG_PREF","14":"LABEL_PREF"
+        "10":"ODO","11":"INLB","12":"DATA_LOG","13":"DATA_LOG_PREF","14":"LABEL_PREF",
+        "15":"CHECK_SENSOR_MFL_CMFL","16":"CHECK_SENSOR_EGP"
     }
     mode = opt_map.get(choice, "INVALID")
     if mode == "INVALID":
