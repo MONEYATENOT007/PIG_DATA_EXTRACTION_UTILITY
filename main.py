@@ -126,6 +126,7 @@ TMAG_LINE_RE = re.compile(
     re.IGNORECASE,
 )
 MT_VALUE_RE = re.compile(r"(-?\d+(?:\.\d+)?)\s*mT\b", re.IGNORECASE)
+ANGLE_VALUE_RE = re.compile(r"(-?\d+(?:\.\d+)?)\s*(?:\u00b0|deg(?:ree)?s?)", re.IGNORECASE)
 
 PROG_TOTAL_SLOTS = 0
 PROG_SLOTS_DONE: Set[Tuple[str, int]] = set()
@@ -378,10 +379,17 @@ def update_simple_log(board_ports: Dict[str, str], option_mode: Optional[str]) -
                 tmag_status = rec.get("tmag_status") if isinstance(rec, dict) else None
                 if isinstance(tmag_status, dict) and tmag_status:
                     parts = []
-                    for idx in SENSOR_CHECK_EXPECTED_TMAGS:
-                        name = f"tmag{idx}"
+                    if option_mode == "CHECK_SENSOR_EGP":
+                        names = sorted(
+                            tmag_status.keys(),
+                            key=lambda n: int(re.search(r"\d+", n).group(0)) if re.search(r"\d+", n) else 0,
+                        )
+                    else:
+                        names = [f"tmag{idx}" for idx in SENSOR_CHECK_EXPECTED_TMAGS]
+                    for name in names:
                         item = tmag_status.get(name, {}) or {}
-                        parts.append(f"T{idx}={'OK' if item.get('ok') else 'BAD'}")
+                        label = name.upper().replace("TMAG", "T")
+                        parts.append(f"{label}={'OK' if item.get('ok') else 'BAD'}")
                     suffix = "(" + ",".join(parts) + ")"
                 elif rec.get("err"):
                     suffix = f"({rec.get('err')})"
@@ -699,6 +707,15 @@ def parse_tmag_values(line: str) -> Optional[Tuple[int, Tuple[str, ...]]]:
         return int(m.group(1)), (_norm_sensor_value(m.group(2)), _norm_sensor_value(m.group(3)))
     return None
 
+def parse_tmag_angle_values(line: str) -> Optional[Tuple[int, Tuple[str, ...]]]:
+    tmag_match = re.search(r"\btmag\s*(\d+)\b", line or "", re.IGNORECASE)
+    if not tmag_match:
+        return None
+    angle_values = tuple(_norm_sensor_value(v) for v in ANGLE_VALUE_RE.findall(line or ""))
+    if not angle_values:
+        return None
+    return int(tmag_match.group(1)), angle_values
+
 def monitor_tmag_values(port_name: str, sample_seconds: float = SENSOR_CHECK_SAMPLE_SECONDS) -> Tuple[bool, Dict[str, Dict[str, object]], List[str]]:
     samples: Dict[int, Set[Tuple[str, ...]]] = {i: set() for i in SENSOR_CHECK_EXPECTED_TMAGS}
     raw_lines: List[str] = []
@@ -742,6 +759,45 @@ def monitor_tmag_values(port_name: str, sample_seconds: float = SENSOR_CHECK_SAM
         }
     return all_ok, detail, raw_lines
 
+def monitor_tmag_angle_values(port_name: str, sample_seconds: float = SENSOR_CHECK_SAMPLE_SECONDS) -> Tuple[bool, Dict[str, Dict[str, object]], List[str]]:
+    samples: Dict[int, Set[Tuple[str, ...]]] = {}
+    raw_lines: List[str] = []
+    end = time.time() + max(0.1, sample_seconds)
+    try:
+        with serial.Serial(port_name, 115200, timeout=0.15) as ser:
+            try:
+                ser.reset_input_buffer()
+            except Exception:
+                pass
+            while time.time() < end and not CANCEL_EVENT.is_set():
+                chunk = ser.readline()
+                if not chunk:
+                    continue
+                line = chunk.decode(errors="ignore").strip()
+                if not line:
+                    continue
+                if len(raw_lines) < 50:
+                    raw_lines.append(line)
+                parsed = parse_tmag_angle_values(line)
+                if parsed:
+                    idx, values = parsed
+                    samples.setdefault(idx, set()).add(values)
+    except Exception as e:
+        return False, {}, [f"monitor failed on {port_name}: {e}"]
+
+    detail: Dict[str, Dict[str, object]] = {}
+    all_ok = bool(samples)
+    for i in sorted(samples.keys()):
+        vals = sorted(samples.get(i, set()))
+        ok = len(vals) >= 2
+        all_ok = all_ok and ok
+        detail[f"tmag{i}"] = {
+            "ok": ok,
+            "samples": len(vals),
+            "values": [",".join(f"{item}deg" for item in v) for v in vals[:5]],
+        }
+    return all_ok, detail, raw_lines
+
 def sensor_slot_command(slot: int) -> str:
     return str(int(slot) + 8)
 
@@ -751,6 +807,8 @@ def sensor_recovery_firmware_for_board(board: str) -> Optional[str]:
         return MFL_FIRMWARE
     if btype == "C-MFL":
         return CMFL_FIRMWARE
+    if btype == "EGP":
+        return EGP_FIRMWARE
     return None
 
 def sensor_check_excluded_ports() -> Set[str]:
@@ -1666,9 +1724,66 @@ def op_sensor_check_mfl_cmfl_slot(board: str, port: str, slot: int, *, already_i
     return ok
 
 def op_sensor_check_egp_slot(board: str, port: str, slot: int, *, already_in_menu: bool = False) -> bool:
-    mark_sensor_check(board, slot, "failed", "EGP sensor check not implemented yet")
-    log(f"[{board}:{slot}] EGP sensor check not implemented yet.")
-    return False
+    if CANCEL_EVENT.is_set():
+        mark_sensor_check(board, slot, "failed", "cancelled")
+        return False
+    if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+        mark_sensor_check(board, slot, "failed", "port/board dead")
+        return False
+    if not already_in_menu:
+        if send_command(port, "0") is None:
+            mark_sensor_check(board, slot, "failed", "serial open failed")
+            return False
+        time.sleep(0.2)
+        if send_command(port, "1") is None:
+            mark_sensor_check(board, slot, "failed", "serial open failed")
+            return False
+        time.sleep(0.5)
+
+    mark_sensor_check(board, slot, "running", "")
+    slot_cmd = sensor_slot_command(slot)
+    before_ports = current_serial_devices()
+    if send_command(port, slot_cmd) is None:
+        mark_sensor_check(board, slot, "failed", "serial open failed (slot connect)")
+        return False
+    time.sleep(SENSOR_CHECK_AFTER_SELECT_DELAY_SECONDS)
+
+    sensor_port = wait_for_new_serial_device(
+        before_ports,
+        timeout_sec=SENSOR_CHECK_PORT_APPEAR_SECONDS,
+        exclude=sensor_check_excluded_ports(),
+    )
+    if not sensor_port:
+        log(f"[{board}:{slot}] No EGP sensor COM after {SENSOR_CHECK_PORT_APPEAR_SECONDS:.0f}s; starting recovery burn.")
+        recovery_before_ports = current_serial_devices()
+        if not recover_sensor_slot_firmware(board, port, slot):
+            mark_sensor_check(board, slot, "failed", f"slot sensor COM not detected after cmd {slot_cmd}; recovery burn failed")
+            return False
+        sensor_port = wait_for_new_serial_device(
+            recovery_before_ports,
+            timeout_sec=SENSOR_CHECK_PORT_APPEAR_SECONDS,
+            exclude=sensor_check_excluded_ports(),
+        )
+        if not sensor_port:
+            mark_sensor_check(board, slot, "failed", "slot sensor COM not detected after recovery burn")
+            return False
+
+    log(f"[{board}:{slot}] Sent EGP sensor slot command {slot_cmd}; COM port detected: {sensor_port}. Sampling angle values for {SENSOR_CHECK_SAMPLE_SECONDS:.0f}s.")
+    ok, detail, raw_lines = monitor_tmag_angle_values(sensor_port, SENSOR_CHECK_SAMPLE_SECONDS)
+    bad = [name for name, rec in detail.items() if not rec.get("ok")]
+    if raw_lines:
+        log(f"[{board}:{slot}] EGP angle sample preview: {' | '.join(raw_lines[:3])}")
+    if ok:
+        mark_sensor_check(board, slot, "success", "", detail)
+        log(f"[{board}:{slot}] EGP SENSOR CHECK OK: discovered TMAG angle values varied.")
+    else:
+        err = "constant/missing angle values"
+        if bad:
+            err += ": " + ", ".join(bad)
+        mark_sensor_check(board, slot, "failed", err, detail)
+        log(f"[{board}:{slot}] EGP SENSOR CHECK FAILED: {err}")
+
+    return ok
 
 def op_label_slot_classic(board: str, port: str, slot: int, *, already_in_menu: bool = False) -> bool:
     # Original LABEL behavior: enter slot menu (1), boot DATA.uf2, and
@@ -2061,11 +2176,21 @@ def process_board_sensor_check_egp(board: str, port: str, selection: Optional[Di
     if get_board_type(board).upper() != "EGP":
         log(f"[{board}] Skipping non-EGP board in EGP sensor check mode.")
         return
+    if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+        log(f"[{board}] Port dead. Skipping board.")
+        return
+    if send_command(port, "1") is None:
+        log(f"[{board}] Could not enter slot management menu; skipping board.")
+        return
+    time.sleep(0.5)
     for slot in selected_slots_for(board, selection):
         if _cancelled():
             break
+        if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+            log(f"[{board}] Port dead. Skipping remaining slots.")
+            break
         op_sensor_check_egp_slot(board, port, slot, already_in_menu=True)
-        time.sleep(0.1)
+        time.sleep(SENSOR_CHECK_BETWEEN_SLOTS_SECONDS)
 
 def process_board_auto_format_and_burn(board: str, port: str, selection: Optional[Dict[str, Set[int]]], stagger_seconds: int = 0) -> None:
     if stagger_seconds > 0:
