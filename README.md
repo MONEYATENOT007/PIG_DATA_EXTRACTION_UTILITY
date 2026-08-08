@@ -1,88 +1,88 @@
-# ⚙️ PIG Data Extraction Utility
+# ⚙️ iPIG HMI & Automation Utility
 
-A Python-based automation utility developed to streamline the extraction, processing, and organization of industrial pipeline inspection data. The application automates repetitive data extraction workflows, significantly reducing manual effort while improving accuracy and processing speed.
+A Python-based Human Machine Interface (HMI) and automation utility developed to simplify the operation, testing, and management of embedded hardware used in industrial pipeline inspection systems (iPIG). The application automates repetitive engineering tasks such as firmware uploading, serial communication, command execution, and device configuration, enabling faster development, testing, and deployment workflows.
 
-Designed for engineering and inspection environments, this utility processes raw inspection data, organizes extracted information into structured formats, and prepares it for further analysis and reporting.
+Designed for engineering teams working with multiple embedded platforms, the utility provides a centralized interface for interacting with microcontrollers including Raspberry Pi Pico and Teensy boards.
 
 ---
 
 ## 🖥️ Application Interface
 
 <p align="center">
-  <img width="1919" height="1079" alt="pic_readme_pdu" src="https://github.com/user-attachments/assets/f6f45cd9-5a79-4002-89b3-45dfb051a6b8" />
+ <img width="1919" height="1079" alt="pic_readme_pdu" src="https://github.com/user-attachments/assets/eedc1d55-328e-4c3b-b77d-ad73a4786902" />
 
 </p>
 
-> 
+> *Replace `application_interface.png` with a screenshot of the application and place it inside the `images` folder.*
 
 ---
 
 # 🚀 Features
 
-- Automated inspection data extraction
-- Batch processing of multiple data files
-- High-speed parsing and data organization
-- Automatic generation of structured output files
-- Reduction of manual processing time
+- Human Machine Interface (HMI) for industrial embedded systems
+- Automated firmware upload to supported development boards
+- Serial communication and command execution
+- Multi-device management through a single interface
+- Automated testing and configuration workflows
+- Device status monitoring
+- Batch execution of repetitive engineering tasks
 - User-friendly desktop interface
-- Error handling and validation
-- Optimized workflow for engineering applications
+- Logging and debugging support
 
 ---
 
 # 📖 Project Overview
 
-Industrial inspection processes often involve large volumes of raw data that require repetitive manual extraction and formatting before analysis.
+Developed to improve the efficiency of embedded firmware development and hardware validation, this application automates multiple repetitive engineering operations through a single desktop interface.
 
-This utility automates the complete workflow by:
+The utility allows engineers to:
 
-- Reading inspection data files
-- Extracting relevant engineering information
-- Processing and organizing extracted data
-- Generating structured outputs for downstream analysis
-- Eliminating repetitive manual operations
-- Improving productivity and consistency
+- Upload firmware to Raspberry Pi Pico and Teensy boards
+- Send predefined or custom serial commands
+- Configure embedded devices
+- Monitor communication with connected hardware
+- Automate repetitive testing procedures
+- Reduce manual intervention during development and validation
 
-The application was designed with a focus on reliability, automation, and ease of use for engineering teams working with industrial inspection datasets.
+By combining firmware management, serial communication, and automation into one application, the tool significantly improves productivity and reduces setup time during embedded system development.
 
 ---
 
 # 🛠️ Technologies Used
 
 - Python
-- Pandas
-- NumPy
 - Tkinter
+- PySerial
+- Multithreading
 - File Handling
-- Data Processing
 - Automation Scripts
 
 ---
 
 # ⚡ Key Capabilities
 
-- Automated data extraction
-- Batch file processing
-- Fast parsing engine
-- Structured data generation
-- Workflow automation
-- Robust error handling
-- Scalable architecture
-- Easy maintenance and extension
+- Firmware deployment automation
+- Serial communication interface
+- HMI for embedded hardware
+- Multi-board support
+- Embedded device management
+- Command automation
+- Engineering workflow optimization
+- Hardware validation support
 
 ---
 
 # 📂 Project Structure
 
 ```text
-PIG_DATA_EXTRACTION_UTILITY/
+PIG_AUTOMATION_UTILITY/
 │
 ├── images/
 │   └── application_interface.png
 │
-├── input/
-├── output/
 ├── src/
+├── firmware/
+├── logs/
 ├── README.md
 └── requirements.txt
 ```
@@ -91,26 +91,27 @@ PIG_DATA_EXTRACTION_UTILITY/
 
 # 🎯 Applications
 
+- Embedded Firmware Development
 - Industrial Automation
-- Pipeline Inspection
-- Engineering Data Processing
-- Inspection Data Management
-- Workflow Automation
-- Embedded System Data Processing
-- Engineering Utilities
+- Pipeline Inspection Systems
+- Hardware Validation
+- Device Configuration
+- Manufacturing Test Automation
+- Engineering Workflow Automation
+- Serial Communication Tools
 
 ---
 
 # 🔮 Future Enhancements
 
-- Multi-threaded processing
-- Automated report generation
-- Database integration
-- Cloud storage support
-- Real-time monitoring
-- Data validation dashboard
-- Excel and PDF export
-- Advanced analytics integration
+- OTA firmware updates
+- Support for additional embedded platforms
+- Automated test sequence execution
+- Live telemetry visualization
+- Device health monitoring
+- Configuration profile management
+- Cloud logging integration
+- Plugin architecture for custom workflows
 
 ---
 
@@ -120,7 +121,7 @@ PIG_DATA_EXTRACTION_UTILITY/
 
 Software Developer | Embedded Firmware Engineer | Python Developer
 
-Interested in Software Development, Automation, Embedded Systems, AI/ML, Data Processing, and Industrial Engineering Solutions.
+Passionate about Embedded Systems, Industrial Automation, Firmware Development, Python, AI/ML, and Intelligent Engineering Solutions.
 
 ---
 
